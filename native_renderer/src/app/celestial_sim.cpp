@@ -66,6 +66,11 @@ double mean_motion(const OrbitalElements& el) {
 Vec3d orbital_position(const OrbitalElements& el, double t_s) {
     // Mirror of astra/orbital/propagation.py (elements advance by n*dt) +
     // astra/orbital/elements.py::elements_to_state (elliptic branch).
+    // Primaries (a == 0, e.g. the Sun) have degenerate elements and sit at the
+    // frame origin by definition — guard before sqrt(mu/a^3) would produce
+    // inf/NaN (found by the v0.3 fidelity gate; previously hidden because
+    // NaN comparisons are always false).
+    if (!(el.a_km > 0.0)) return {0.0, 0.0, 0.0};
     const double M = el.M0 + mean_motion(el) * (t_s - el.epoch_s);
     const double E = solve_kepler_elliptic(M, el.e);
     const double nu = eccentric_to_true(E, el.e);
@@ -73,6 +78,18 @@ Vec3d orbital_position(const OrbitalElements& el, double t_s) {
     const double r = p / (1.0 + el.e * std::cos(nu));
     const Vec3d r_pqw = {r * std::cos(nu), r * std::sin(nu), 0.0};
     return rotation_pqw_to_ijk(el.i, el.raan, el.argp, r_pqw);
+}
+
+Vec3d orbital_velocity(const OrbitalElements& el, double t_s) {
+    // Mirror of astra/orbital/elements.py::elements_to_state velocity branch.
+    if (!(el.a_km > 0.0)) return {0.0, 0.0, 0.0}; // primary at rest at origin
+    const double M = el.M0 + mean_motion(el) * (t_s - el.epoch_s);
+    const double E = solve_kepler_elliptic(M, el.e);
+    const double nu = eccentric_to_true(E, el.e);
+    const double p = el.a_km * (1.0 - el.e * el.e);
+    const double vf = std::sqrt(el.mu / p);
+    const Vec3d v_pqw = {-vf * std::sin(nu), vf * (el.e + std::cos(nu)), 0.0};
+    return rotation_pqw_to_ijk(el.i, el.raan, el.argp, v_pqw);
 }
 
 std::vector<Vec3d> orbit_polyline(const OrbitalElements& el, double t_s, int n) {
@@ -135,6 +152,20 @@ std::vector<Vec3d> propagate_world(const std::vector<CelestialBody>& bodies, dou
     std::vector<Vec3d> world(bodies.size());
     for (size_t i = 0; i < bodies.size(); ++i) {
         const Vec3d rel = orbital_position(bodies[i].elements, t_s);
+        if (bodies[i].parent >= 0) {
+            const Vec3d& pw = world[static_cast<size_t>(bodies[i].parent)];
+            world[i] = {pw[0] + rel[0], pw[1] + rel[1], pw[2] + rel[2]};
+        } else {
+            world[i] = rel;
+        }
+    }
+    return world;
+}
+
+std::vector<Vec3d> propagate_world_velocity(const std::vector<CelestialBody>& bodies, double t_s) {
+    std::vector<Vec3d> world(bodies.size());
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const Vec3d rel = orbital_velocity(bodies[i].elements, t_s);
         if (bodies[i].parent >= 0) {
             const Vec3d& pw = world[static_cast<size_t>(bodies[i].parent)];
             world[i] = {pw[0] + rel[0], pw[1] + rel[1], pw[2] + rel[2]};

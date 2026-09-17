@@ -1,3 +1,26 @@
+# ASTRA COSMOS — COMPLETE BUILD REPORT (v0.3 cumulative)
+
+**v0.3 increment appended at top; v0.2 body retained below for provenance.**
+
+## v0.3 results (Step 2, first increment)
+
+1. **Initial state**: v0.2 at `66dab8f` + inspection report `7d143ea` (baseline).
+2. **Features preserved**: all v0.2 systems + 1535/1535 pytest + gates intact.
+3. **Files changed this increment**:
+   - `native_renderer/src/app/celestial_sim.{h,cpp}` — `orbital_velocity` + `propagate_world_velocity`; **NaN root-cause fix** on degenerate primary elements (a==0).
+   - `native_renderer/src/scene/scene.h` — `ObjectState.velocity_km_s` (backwards-compatible trailing member).
+   - `native_renderer/src/main_production.cpp` — camera modes (orbit-follow/FREE), WASDQE, sim controls (step `.`, presets 0–8, Backspace, F5), selection highlight, velocity-vector draws, expanded title + F1 inspector (peri/apo, period, parent, provenance, light-time delay, NOT AVAILABLE fields).
+   - `native_renderer/src/shaders/vector.vert` (+reuse `orbit.frag`) — velocity pipeline.
+   - `native_renderer/CMakeLists.txt` — 7 production shaders.
+   - `scripts/gen_kepler_reference.py` — FULL authoritative state (positions+velocities through `elements_to_state`).
+   - `native_renderer/tests/kepler_mirror_check.cpp` — velocity gate + parent-chain velocity + strict bit-determinism (99 checks).
+   - Docs: this report, `ASTRA_IMPLEMENTATION_STATUS.md`, README §7.1.
+4. **Build results**: native Release **95/95 targets** (cmake 4.4.3/ninja, real /tmp/vk SDK: Vulkan 1.4.362 headers+loader, glslang 16.6.0 — rebuilt this turn after sandbox wipe).
+5. **Test results**: pytest **1535/1535 PASS (28.7 s)**; kepler gate **99/99, max rel err 3.55e-13**; native validator **23/23 shaders, 0 fails, no leaks**; production shaders **7/7 glslang OK**; `main_production.cpp` syntax vs real headers **0 errors**.
+6. **Bug found & fixed (root cause)**: Sun degenerate elements propagated NaN into all world positions (hidden in v0.2 because NaN comparisons are false); primary now anchored at frame origin; strict determinism check prevents recurrence.
+7. **Windows runtime / GPU results**: **BLOCKED (no Windows/GPU in this sandbox)** — nothing in v0.3 is claimed runtime-verified; the 22-item Phase-A checklist remains open for a real Windows machine.
+8. **Remaining blockers (unchanged list, ranked)**: Windows run ✕ visual evidence; HUD/labels on-canvas; audio binding; deeper engine bindings (N-body/relativity/…); persistence/Supabase wiring; packaging.
+
 # ASTRA COSMOS — COMPLETE BUILD REPORT (v0.2)
 
 **Date**: 2026-09-18 · **Branch**: `arena/01a0b082-astra-repair` · **Environment**: Linux x86_64 sandbox (Patna, IN user), **no Windows machine, no physical GPU** in this environment. Compare atmosphere of truth to phase-1/2 reports: nothing here claims runtime success on Windows.

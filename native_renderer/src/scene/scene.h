@@ -16,6 +16,10 @@ struct ObjectState {
     int lod = 0;
     float mass_kg = 0;
     float rs = 0.f; // Schwarzschild radius render units
+    // Appended in v0.3 (trailing member w/ default; positional initializers
+    // elsewhere are unaffected): authoritative heliocentric velocity (km/s,
+    // double) for velocity-vector visualization and the inspector.
+    WorldPos velocity_km_s{0, 0, 0};
 };
 
 struct RenderState {

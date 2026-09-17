@@ -243,6 +243,7 @@ if(GLSLANG_VALIDATOR)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/sphere.frag"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/orbit.vert"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/orbit.frag"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/vector.vert"
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})

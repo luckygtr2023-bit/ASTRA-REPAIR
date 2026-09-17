@@ -1,3 +1,34 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.3 Integrated Simulation)
+
+## 0. v0.3 increment (this stage of Step 2)
+
+Environment constraint (unchanged): **PHASE A (real Windows runtime) is
+BLOCKED here** — no Windows machine / no GPU in this sandbox. Runtime items
+remain NOT VERIFIED by definition; everything below is validated to the
+maximum source + executable-gate level available on Linux.
+
+Implemented (source) and validated (executable gates):
+
+| Area (brief phase) | What v0.3 added | Status / gate |
+|--------------------|-----------------|---------------|
+| **B — RenderState/scene binding** | ObjectState gained authoritative `velocity_km_s` (double); frames now name parents; classification strings bound per object | VERIFIED (build 95/95; scene.h trailing-member change is backwards-compatible) |
+| **C — celestial rendering** | Selection highlight (+30 % tint), velocity vectors (toggle V) as a new `vector.vert` pipeline (real vis direction; CINEMATIC length) | IMPLEMENTED, NOT GPU-VERIFIED; shader validated by glslang 16.6.0 (7/7 OK) |
+| **D — camera/exploration** | Camera modes: orbit-follow ↔ **FREE** (key O), WASDQE movement in camera plane, SHIFT/PgUp fast, target-relative coordinates only (never float absolute) | IMPLEMENTED, NOT GPU-VERIFIED |
+| **E — scientific inspector** | Expanded: speed (real vis velocity), peri/apo, period, parent, frame, provenance, light-travel delay to observer (Newtonian c approx, labeled), NOT AVAILABLE for unknowns (planet T_eff / luminosity / age) | IMPLEMENTED, console/title-bar runtime shipped |
+| **F — simulation controls** | step (`.`), warp presets (0–8 → 1×…1e8×), epoch reset (Backspace), scenario restart (F5); reverse time deliberately **not offered** (not a supported property of the mirrored authority — integrity) | IMPLEMENTED, NOT GPU-VERIFIED |
+| **G — fidelity gate (orbital)** | Extended reference generation to FULL authoritative state via `elements_to_state` (position AND velocity), 99 checks incl. parent chains (pos+vel) and bit-determinism | **VERIFIED: 99/99 PASS, max rel err 3.55e-13** |
+| **G — resurfaced real bug** | `propagate_world` used the Sun's degenerate elements (a=0) → sqrt(mu/a³)=inf → **NaN into every world position** (v0.2 invisible in gates because NaN comparisons are false) | **FIXED + now covered** (strict-equality determinism + NaN-immune gates); primary sits at frame origin by definition |
+
+Kept VERIFIED: 1535/1535 pytest (28.7 s); native validator (23 shaders ok / 0 fail,
+no leaks); `main_production.cpp` type-check vs real Vulkan 1.4.362 headers (0 errors);
+native build 95/95 targets with the real /tmp/vk SDK.
+
+No change audited as "weakening tests": the gate grew strict-new checks instead.
+
+(For the v0.2 table and prior validation details see below, unmodified.)
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v0.2 Integrated Simulation)
 
 **Authority**: this file is the manual status checkpoint required by the project

@@ -201,8 +201,11 @@ and rendered each frame with real Vulkan: depth-tested lit bodies (icosphere,
 lambert + emissive star), Kepler orbit overlays evaluated in-shader from real
 elements, procedural starfield background, floating-origin camera.
 
-- **Controls**: Arrows = orbit camera · PgUp/PgDn = zoom · Tab / Shift+Tab = select body ·
-  `+` / `-` = time warp ×2 / ÷2 · Space = pause · Home = reset view · F1 = console inspector · ESC = quit.
+- **Controls (v0.3)**: arrows = look/orbit · Tab / Shift+Tab = select body · `O` = orbit-follow ↔ FREE camera ·
+  `W A S D Q E` = FREE-camera move (SHIFT/PgUp fast, PgDn slow) · `+` / `-` = warp ×2/÷2 · `0`–`8` = warp presets (1×…1e8×) ·
+  Space = pause · `.` = sim step · Backspace = epoch reset (J2000) · F5 = scenario restart · V = velocity vectors ·
+  Home = reset view · F1 = full scientific inspector · ESC = quit. (Reverse time is intentionally not offered:
+  the mirrored scientific authority does not define it.)
 - **Inspector**: the title bar always shows focus body, true SI heliocentric distance (AU),
   vis-viva speed (km/s), epoch (J2000 + years), warp, and the classification tag
   (`SIMULATED (Kepler, JPL approx. elements)`). CINEMATIC visual scaling (sublinear

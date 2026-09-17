@@ -21,6 +21,7 @@ import sys
 
 from astra.orbital.kepler import solve_kepler_elliptic
 from astra.orbital.anomalies import eccentric_to_true
+from astra.orbital.elements import ClassicalOrbitalElements, elements_to_state
 
 AU_KM = 149_597_870.7
 GM_SUN = 1.32712440018e11  # km^3 s^-2
@@ -53,30 +54,30 @@ DAY_S = 86400.0
 TIMES_S = [0.0, 40_000.0, DAY_S, 0.1 * 365.25 * DAY_S, 365.25 * DAY_S]
 
 
-def orbital_position(a: float, e: float, i: float, raan: float, argp: float,
-                M0: float, mu: float, t: float) -> tuple[float, float, float]:
+def authoritative_state(a: float, e: float, i: float, raan: float, argp: float,
+                        M0: float, mu: float, t: float):
+    """Full state (position AND velocity) composed entirely from the Python
+    authority: kepler solve -> true anomaly -> ClassicalOrbitalElements ->
+    elements_to_state. No hand-derived formulas here on purpose."""
     n = math.sqrt(mu / (a ** 3))  # mean motion (n = sqrt(mu/a^3))
     M = M0 + n * t
     E = solve_kepler_elliptic(M, e)
     nu = eccentric_to_true(E, e)
     p = a * (1.0 - e * e)
-    r = p / (1.0 + e * math.cos(nu))
-    pqw = (r * math.cos(nu), r * math.sin(nu), 0.0)
-    cO, sO = math.cos(raan), math.sin(raan)
-    ci, si = math.cos(i), math.sin(i)
-    cw, sw = math.cos(argp), math.sin(argp)
-    x = (cO * cw - sO * ci * sw) * pqw[0] + (-cO * sw - sO * ci * cw) * pqw[1] + (sO * si) * pqw[2]
-    y = (sO * cw + cO * ci * sw) * pqw[0] + (-sO * sw + cO * ci * cw) * pqw[1] + (-cO * si) * pqw[2]
-    z = (si * sw) * pqw[0] + (si * cw) * pqw[1] + ci * pqw[2]
-    return (x, y, z)
+    coe = ClassicalOrbitalElements(
+        semi_latus_rectum=p, eccentricity=e, inclination=i, raan=raan,
+        argument_of_periapsis=argp, true_anomaly=nu, mu=mu)
+    st = elements_to_state(coe, epoch=0.0)
+    return ((st.position.x, st.position.y, st.position.z),
+            (st.velocity.x, st.velocity.y, st.velocity.z))
 
 
 def main() -> int:
-    print("body,t_s,x_km,y_km,z_km")
+    print("body,t_s,x_km,y_km,z_km,vx_kms,vy_kms,vz_kms")
     for name, (a, e, i, raan, argp, M0, mu) in BODIES:
         for t in TIMES_S:
-            x, y, z = orbital_position(a, e, i, raan, argp, M0, mu, t)
-            print(f"{name},{t:.1f},{x:.12e},{y:.12e},{z:.12e}")
+            (x, y, z), (vx, vy, vz) = authoritative_state(a, e, i, raan, argp, M0, mu, t)
+            print(f"{name},{t:.1f},{x:.12e},{y:.12e},{z:.12e},{vx:.12e},{vy:.12e},{vz:.12e}")
     return 0
 
 

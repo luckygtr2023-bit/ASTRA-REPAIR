@@ -57,6 +57,10 @@ double eccentric_to_true(double E, double e);
 Vec3d orbital_position(const OrbitalElements& el, double t_s);
 // Mean motion n = sqrt(mu / a^3) (rad/s).
 double mean_motion(const OrbitalElements& el);
+// Velocity in the parent frame (km/s) at time t (mirror of
+// astra/orbital/elements.py::elements_to_state velocity branch:
+// v_factor = sqrt(mu/p), v_pqw = (-vf sin n, vf (e + cos n), 0) -> IJK).
+Vec3d orbital_velocity(const OrbitalElements& el, double t_s);
 // True-anomaly sample of the full orbit (for the orbit-path overlay).
 // Returns N evenly spaced (in mean anomaly) parent-frame positions.
 std::vector<Vec3d> orbit_polyline(const OrbitalElements& el, double t_s, int n);
@@ -82,6 +86,8 @@ std::vector<CelestialBody> make_solar_system();
 // Propagate the whole system and return WORLD positions (double, km,
 // heliocentric). Moons use parent(world) + relative. Deterministic.
 std::vector<Vec3d> propagate_world(const std::vector<CelestialBody>& bodies, double t_s);
+// Same for velocities (heliocentric km/s; moons add parent velocity).
+std::vector<Vec3d> propagate_world_velocity(const std::vector<CelestialBody>& bodies, double t_s);
 
 // ---- Simulation clock (sim seconds, explicit warp, pausable) ----------------
 struct SimClock {

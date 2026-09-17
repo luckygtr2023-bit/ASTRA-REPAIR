@@ -23,6 +23,7 @@ struct Row {
     std::string body;
     double t;
     double x, y, z;
+    double vx, vy, vz;
 };
 
 int main(int argc, char** argv) {
@@ -48,7 +49,10 @@ int main(int argc, char** argv) {
         std::getline(ss, cell, ','); r.t = std::stod(cell);
         std::getline(ss, cell, ','); r.x = std::stod(cell);
         std::getline(ss, cell, ','); r.y = std::stod(cell);
-        std::getline(ss, cell);      r.z = std::stod(cell);
+        std::getline(ss, cell, ','); r.z = std::stod(cell);
+        std::getline(ss, cell, ','); r.vx = std::stod(cell);
+        std::getline(ss, cell, ','); r.vy = std::stod(cell);
+        std::getline(ss, cell);      r.vz = std::stod(cell);
         rows.push_back(r);
     }
     if (rows.empty()) {
@@ -79,8 +83,21 @@ int main(int argc, char** argv) {
         ++checks;
         if (rel > worst) worst = rel;
         if (rel > TOL) {
-            std::printf("FAIL %s t=%g: rel=%.3e  C++(%.12e %.12e %.12e) PY(%.12e %.12e %.12e)\n",
+            std::printf("FAIL pos %s t=%g: rel=%.3e  C++(%.12e %.12e %.12e) PY(%.12e %.12e %.12e)\n",
                         r.body.c_str(), r.t, rel, p[0], p[1], p[2], r.x, r.y, r.z);
+            ++fails;
+        }
+        // Velocity gate (v0.3): C++ orbital_velocity vs Python elements_to_state.
+        const astra::app::Vec3d vv = astra::app::orbital_velocity(body->elements, r.t);
+        const double dvx = vv[0] - r.vx, dvy = vv[1] - r.vy, dvz = vv[2] - r.vz;
+        const double verr = std::sqrt(dvx * dvx + dvy * dvy + dvz * dvz);
+        const double vmag = std::sqrt(r.vx * r.vx + r.vy * r.vy + r.vz * r.vz);
+        const double vrel = (vmag > 0.0) ? verr / vmag : verr;
+        ++checks;
+        if (vrel > worst) worst = vrel;
+        if (vrel > TOL) {
+            std::printf("FAIL vel %s t=%g: rel=%.3e  C++(%.9e %.9e %.9e) PY(%.9e %.9e %.9e)\n",
+                        r.body.c_str(), r.t, vrel, vv[0], vv[1], vv[2], r.vx, r.vy, r.vz);
             ++fails;
         }
     }
@@ -103,6 +120,28 @@ int main(int argc, char** argv) {
             ++checks;
             if (rel > TOL) {
                 std::printf("FAIL parent-chain moon[%d]: rel=%.3e\n", k, rel);
+                ++fails;
+            }
+        }
+        // Parent-chain velocity: world velocity of Moon = Earth + geocentric.
+        const auto vworld = astra::app::propagate_world_velocity(bodies, 86400.0);
+        for (int k = 0; k < 3; ++k) {
+            const double mv = astra::app::orbital_velocity(earth.elements, 86400.0)[k] +
+                              astra::app::orbital_velocity(moon.elements, 86400.0)[k];
+            const double e_err = std::fabs(vworld[9][k] - mv);
+            const double rel = e_err / std::fabs(mv);
+            ++checks;
+            if (rel > TOL) {
+                std::printf("FAIL parent-chain moon velocity[%d]: rel=%.3e\n", k, rel);
+                ++fails;
+            }
+        }
+        // Determinism: repeated propagation must be bit-identical.
+        const auto w2 = astra::app::propagate_world(bodies, 86400.0);
+        for (int k = 0; k < 3; ++k) {
+            ++checks;
+            if (w2[9][k] != world[9][k]) {
+                std::printf("FAIL determinism[%d]\n", k);
                 ++fails;
             }
         }
