@@ -191,6 +191,30 @@ C++20 `CMAKE_CXX_STANDARD 20` `-O3 -flto` at `native_renderer/`
 
 Renderer systems: foundational RHI/scene, planetary, terrain, atmosphere, clouds, oceans, stars, rings, nebulae, galaxies, clusters, cosmic, extreme physics, VFX, cinematic, performance — all USED per `validate 221 OK`.
 
+### 7.1 ASTRA COSMOS v0.2 — Integrated Simulation (IMPLEMENTED, source-validated)
+
+`native_renderer/src/main_production.cpp` is now a real integrated application, not a graphics test: the solar system (Sun + 8 planets + Moon) is simulated in
+double precision by a C++ mirror of the Python scientific authority
+(`native_renderer/src/app/celestial_sim.cpp`, mirrored from `astra/orbital/kepler.py`,
+`anomalies.py`, `elements.py`; JPL J2000 approximate elements — DATA-DERIVED/APPROXIMATE)
+and rendered each frame with real Vulkan: depth-tested lit bodies (icosphere,
+lambert + emissive star), Kepler orbit overlays evaluated in-shader from real
+elements, procedural starfield background, floating-origin camera.
+
+- **Controls**: Arrows = orbit camera · PgUp/PgDn = zoom · Tab / Shift+Tab = select body ·
+  `+` / `-` = time warp ×2 / ÷2 · Space = pause · Home = reset view · F1 = console inspector · ESC = quit.
+- **Inspector**: the title bar always shows focus body, true SI heliocentric distance (AU),
+  vis-viva speed (km/s), epoch (J2000 + years), warp, and the classification tag
+  (`SIMULATED (Kepler, JPL approx. elements)`). CINEMATIC visual scaling (sublinear
+  radius exaggeration, 1 AU = 100 units) happens only at the visualization boundary
+  and never alters the scientific state.
+- **Fidelity gate**: `scripts/gen_kepler_reference.py` (Python authority) +
+  `native_renderer/tests/kepler_mirror_check.cpp` — 48 checks, max relative error
+  3.6e-13 vs 1e-9 tolerance. **VERIFIED (source-level, Linux).**
+- **NOT VERIFIED**: any Windows build/run or real-GPU frame of this application
+  (no Windows machine in this environment). See `ASTRA_IMPLEMENTATION_STATUS.md`
+  and `ASTRA_COMPLETE_BUILD_REPORT.md` for the honest matrix.
+
 ---
 
 ## 8. Vulkan Validation

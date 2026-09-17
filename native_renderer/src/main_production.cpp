@@ -1,6 +1,14 @@
-// ASTRA COSMOS — Production Win32 + Vulkan Entry Point
-// Real rendering: fullscreen-triangle pipeline + push constants bound to ASTRA
-// scientific state, runtime SPIR-V loading and full swapchain recreation.
+// ASTRA COSMOS — Production Win32 + Vulkan application (v0.2 Integrated Simulation)
+//
+// One integrated application: the scientific simulation (mirror of the Python
+// authority astra.orbital) drives RenderState; the renderer consumes it every
+// frame. No mock Vulkan. Positions/times are simulated truthfully in double
+// precision and rebased to renderer floats only at the visualization boundary.
+//
+// Controls (keyboard, see README):
+//   Arrows orbit camera | PgUp/PgDn zoom | Tab/Shift+Tab select body
+//   +/- time warp | Space pause | Home reset view | F1 console inspector
+//   ESC quit
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -9,23 +17,38 @@
 #include <vulkan/vulkan_win32.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ASTRA engine headers (preserved)
 #include "scene/floating_origin.h"
 #include "scene/scene.h"
+// ASTRA application layer (mirror of the Python scientific authority)
+#include "app/celestial_sim.h"
+#include "app/orbit_camera.h"
 
-// Globals
+// ─── Application state ────────────────────────────────────────────────────────
+static std::vector<astra::app::CelestialBody> g_bodies;
+static std::vector<astra::app::Vec3d> g_world;
+static astra::app::SimClock g_clock;
+static astra::app::OrbitCamera g_camera;
+static int g_focus = 3;                     // Earth
+static const double POS_SCALE = 100.0 / astra::app::AU_KM; // km -> render units
+static bool g_keys[256] = {};
+
+// ─── Window state ─────────────────────────────────────────────────────────────
 static HWND g_hwnd = nullptr;
 static bool g_quit = false;
 static bool g_minimized = false;
 static uint32_t g_width = 1280, g_height = 720;
 
-// Vulkan core
+// ─── Vulkan core ──────────────────────────────────────────────────────────────
 static VkInstance g_instance = VK_NULL_HANDLE;
 static VkPhysicalDevice g_gpu = VK_NULL_HANDLE;
 static VkDevice g_device = VK_NULL_HANDLE;
@@ -45,13 +68,28 @@ static VkSemaphore g_img_sem = VK_NULL_HANDLE;
 static VkSemaphore g_render_sem = VK_NULL_HANDLE;
 static VkFence g_fence = VK_NULL_HANDLE;
 
-// Pipeline
+// Depth buffer
+static VkImage g_depth_img = VK_NULL_HANDLE;
+static VkDeviceMemory g_depth_mem = VK_NULL_HANDLE;
+static VkImageView g_depth_view = VK_NULL_HANDLE;
+static VkFormat g_depth_format = VK_FORMAT_D32_SFLOAT;
+
+// Geometry (unit icosphere, shared by every body draw)
+static VkBuffer g_vb = VK_NULL_HANDLE;
+static VkDeviceMemory g_vb_mem = VK_NULL_HANDLE;
+static VkBuffer g_ib = VK_NULL_HANDLE;
+static VkDeviceMemory g_ib_mem = VK_NULL_HANDLE;
+static uint32_t g_index_count = 0;
+
+// Pipelines (single 128-byte push-constant layout shared by all three)
 static VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
-static VkPipeline g_graphics_pipeline = VK_NULL_HANDLE;
+static VkPipeline g_pipe_bg = VK_NULL_HANDLE;    // fullscreen starfield
+static VkPipeline g_pipe_mesh = VK_NULL_HANDLE;  // lit celestial bodies
+static VkPipeline g_pipe_orbit = VK_NULL_HANDLE; // Kepler trajectory overlays
 static VkShaderModule g_vert_module = VK_NULL_HANDLE;
 static VkShaderModule g_frag_module = VK_NULL_HANDLE;
 
-// ASTRA state
+// ASTRA RenderState binding (mirrors bridge contract; truthful per frame)
 static astra::scene::Scene g_scene;
 static uint64_t g_frame_count = 0;
 static volatile bool g_swapchain_dirty = false;
@@ -67,7 +105,6 @@ static volatile bool g_swapchain_dirty = false;
     } while (0)
 
 // ─── Filesystem helpers ───────────────────────────────────────────────────────
-
 static std::string exe_dir() {
     char buf[MAX_PATH];
     DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
@@ -90,7 +127,35 @@ static bool read_spirv(const std::string& path, std::vector<uint32_t>& out) {
     return ok && out[0] == 0x07230203u; // SPIR-V magic
 }
 
-// ─── Window ───────────────────────────────────────────────────────────────────
+static bool load_shader(const char* name, std::vector<uint32_t>& out) {
+    const std::string dir = exe_dir();
+    const std::string bases[] = {dir + "\\shaders\\", ".\\shaders\\", dir + "\\", ".\\"};
+    for (const auto& base : bases) {
+        const std::string path = base + name;
+        if (read_spirv(path, out)) {
+            printf("[ASTRA] Shader loaded: %s\n", path.c_str());
+            return true;
+        }
+    }
+    printf("[ASTRA] Missing shader %s — expected shaders\\%s next to ASTRA COSMOS.exe\n", name, name);
+    return false;
+}
+
+static VkShaderModule create_shader_module(const std::vector<uint32_t>& words) {
+    if (words.empty()) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = words.size() * sizeof(uint32_t);
+    ci.pCode = words.data();
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(g_device, &ci, nullptr, &module) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    return module;
+}
+
+// ─── Window / input ───────────────────────────────────────────────────────────
+static void focus_body(int idx, bool reset_view);
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -102,20 +167,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         {
             uint32_t w = LOWORD(lp), h = HIWORD(lp);
             if (w != 0 && h != 0 && (w != g_width || h != g_height)) {
-                g_width = w;
-                g_height = h;
-                g_swapchain_dirty = true; // framebuffer size changed — recreate
+                g_width = w; g_height = h; g_swapchain_dirty = true;
             }
         }
         return 0;
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) g_quit = true;
+    case WM_KEYUP:
+        if (wp < 256) g_keys[wp] = false;
         return 0;
+    case WM_KEYDOWN: {
+        if (wp < 256) g_keys[wp] = true;
+        const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        switch (wp) {
+        case VK_ESCAPE: g_quit = true; break;
+        case VK_TAB:   focus_body((g_focus + (shift ? -1 : 1) + (int)g_bodies.size()) % (int)g_bodies.size(), true); break;
+        case VK_SPACE: g_clock.paused = !g_clock.paused; break;
+        case VK_HOME:  focus_body(g_focus, true); break;
+        case VK_OEM_PLUS: case VK_ADD:      g_clock.warp = astra::app::SimClock::clamp_warp(g_clock.warp * 2.0); break;
+        case VK_OEM_MINUS: case VK_SUBTRACT: g_clock.warp = astra::app::SimClock::clamp_warp(g_clock.warp / 2.0); break;
+        case VK_F1: {
+            extern void dump_inspector();
+            dump_inspector();
+            break;
+        }
+        }
+        return 0;
+    }
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-// Create window
 static bool create_window() {
     HINSTANCE hinst = GetModuleHandleA(nullptr);
     WNDCLASSEXA wc{};
@@ -143,33 +223,27 @@ static bool create_window() {
     return true;
 }
 
-// Create Vulkan instance
+// ─── Vulkan bootstrap (instance/surface/device/swapchain) ─────────────────────
 static bool create_instance() {
     VkApplicationInfo app_info{};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app_info.pApplicationName = "ASTRA COSMOS";
-    app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
+    app_info.applicationVersion = VK_MAKE_VERSION(0, 2, 0);
     app_info.pEngineName = "ASTRA Native";
-    app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
+    app_info.engineVersion = VK_MAKE_VERSION(0, 2, 0);
     app_info.apiVersion = VK_API_VERSION_1_3;
 
-    const char* extensions[] = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_KHR_WIN32_SURFACE_EXTENSION_NAME
-    };
-
+    const char* extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     VkInstanceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ci.pApplicationInfo = &app_info;
     ci.enabledExtensionCount = 2;
     ci.ppEnabledExtensionNames = extensions;
-
     VK_CHECK(vkCreateInstance(&ci, nullptr, &g_instance));
     printf("[ASTRA] Vulkan instance created\n");
     return true;
 }
 
-// Create surface
 static bool create_surface() {
     VkWin32SurfaceCreateInfoKHR ci{};
     ci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
@@ -180,7 +254,6 @@ static bool create_surface() {
     return true;
 }
 
-// Select GPU and create device
 static bool create_device() {
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(g_instance, &count, nullptr);
@@ -188,15 +261,13 @@ static bool create_device() {
     std::vector<VkPhysicalDevice> devs(count);
     vkEnumeratePhysicalDevices(g_instance, &count, devs.data());
 
-    // Prefer a discrete GPU, then integrated, then anything else.
     int best_score = -1;
     for (auto& d : devs) {
         VkPhysicalDeviceProperties p{};
         vkGetPhysicalDeviceProperties(d, &p);
         int score = (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)   ? 3
                   : (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 2
-                  : (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU)    ? 1
-                                                                             : 0;
+                  : (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU)    ? 1 : 0;
         if (score > best_score) { best_score = score; g_gpu = d; }
     }
 
@@ -204,7 +275,6 @@ static bool create_device() {
     vkGetPhysicalDeviceProperties(g_gpu, &props);
     printf("[ASTRA] GPU: %s\n", props.deviceName);
 
-    // Find graphics + present queue family
     uint32_t qfc = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(g_gpu, &qfc, nullptr);
     std::vector<VkQueueFamilyProperties> qfs(qfc);
@@ -215,10 +285,7 @@ static bool create_device() {
         if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
             VkBool32 present = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(g_gpu, i, g_surface, &present);
-            if (present) {
-                g_gfx_family = i;
-                break;
-            }
+            if (present) { g_gfx_family = i; break; }
         }
     }
     if (g_gfx_family == UINT32_MAX) return false;
@@ -230,7 +297,7 @@ static bool create_device() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
 
-    const char* dev_exts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+    const char* dev_exts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
@@ -244,45 +311,29 @@ static bool create_device() {
     return true;
 }
 
-// Create swapchain (also used on recreation; framebuffers/views are rebuilt there)
 static bool create_swapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_gpu, g_surface, &caps);
 
     uint32_t fmt_count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_gpu, g_surface, &fmt_count, nullptr);
-    if (fmt_count == 0) {
-        printf("[ASTRA] Surface exposes no formats\n");
-        return false;
-    }
+    if (fmt_count == 0) { printf("[ASTRA] Surface exposes no formats\n"); return false; }
     std::vector<VkSurfaceFormatKHR> fmts(fmt_count);
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_gpu, g_surface, &fmt_count, fmts.data());
 
     VkSurfaceFormatKHR fmt = fmts[0];
     for (auto& f : fmts) {
-        if (f.format == VK_FORMAT_B8G8R8A8_SRGB && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            fmt = f;
-            break;
-        }
+        if (f.format == VK_FORMAT_B8G8R8A8_SRGB && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { fmt = f; break; }
     }
 
     VkExtent2D extent = caps.currentExtent;
-    if (extent.width == UINT32_MAX) {
-        extent.width = g_width;
-        extent.height = g_height;
-    }
-    // Clamp into the surface-supported range (resize-safe).
+    if (extent.width == UINT32_MAX) { extent.width = g_width; extent.height = g_height; }
     extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
     extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
-    if (extent.width == 0 || extent.height == 0) {
-        printf("[ASTRA] Surface extent is zero (minimized?) — deferring swapchain\n");
-        return false;
-    }
+    if (extent.width == 0 || extent.height == 0) return false;
 
     uint32_t image_count = caps.minImageCount + 1;
-    if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) {
-        image_count = caps.maxImageCount; // respect driver limit
-    }
+    if (caps.maxImageCount > 0 && image_count > caps.maxImageCount) image_count = caps.maxImageCount;
 
     VkSwapchainCreateInfoKHR sci{};
     sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
@@ -296,7 +347,7 @@ static bool create_swapchain() {
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform = caps.currentTransform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR; // guaranteed to exist
+    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     sci.clipped = VK_TRUE;
 
     VK_CHECK(vkCreateSwapchainKHR(g_device, &sci, nullptr, &g_swapchain));
@@ -327,36 +378,185 @@ static bool create_swapchain() {
     return true;
 }
 
-// Create render pass
-static bool create_render_pass() {
-    VkAttachmentDescription att{};
-    att.format = g_sc_format;
-    att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    att.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+// ─── Memory / buffers ─────────────────────────────────────────────────────────
+static uint32_t find_memory_type(uint32_t type_bits, VkMemoryPropertyFlags props) {
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g_gpu, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+        if ((type_bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & props) == props) return i;
+    }
+    return UINT32_MAX;
+}
 
-    VkAttachmentReference ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+static bool create_upload_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                 VkBuffer& buf, VkDeviceMemory& mem) {
+    VkBufferCreateInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bi.size = size;
+    bi.usage = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(g_device, &bi, nullptr, &buf));
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g_device, buf, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) return false;
+    VK_CHECK(vkAllocateMemory(g_device, &ai, nullptr, &mem));
+    VK_CHECK(vkBindBufferMemory(g_device, buf, mem, 0));
+    return true;
+}
+
+// ─── Depth buffer ─────────────────────────────────────────────────────────────
+static VkFormat choose_depth_format() {
+    const VkFormat cands[] = {VK_FORMAT_D32_SFLOAT, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D16_UNORM};
+    for (VkFormat f : cands) {
+        VkFormatProperties p{};
+        vkGetPhysicalDeviceFormatProperties(g_gpu, f, &p);
+        if (p.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) return f;
+    }
+    return VK_FORMAT_D32_SFLOAT;
+}
+
+static bool create_depth() {
+    g_depth_format = choose_depth_format();
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = g_depth_format;
+    ii.extent = {g_sc_extent.width, g_sc_extent.height, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(g_device, &ii, nullptr, &g_depth_img));
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, g_depth_img, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) return false;
+    VK_CHECK(vkAllocateMemory(g_device, &ai, nullptr, &g_depth_mem));
+    VK_CHECK(vkBindImageMemory(g_device, g_depth_img, g_depth_mem, 0));
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = g_depth_img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = g_depth_format;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vi.subresourceRange.baseMipLevel = 0;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.baseArrayLayer = 0;
+    vi.subresourceRange.layerCount = 1;
+    VK_CHECK(vkCreateImageView(g_device, &vi, nullptr, &g_depth_view));
+    return true;
+}
+
+// ─── Unit icosphere (subdivision 2: 162 vertices, 960 indices) ────────────────
+struct MeshData { std::vector<float> verts; std::vector<uint16_t> indices; };
+
+static MeshData make_icosphere(int subdivisions) {
+    const float t = 1.61803398875f;
+    const float inv = 1.0f / std::sqrt(1.0f + t * t);
+    std::vector<float> v = {
+        -inv,  t*inv, 0,   inv,  t*inv, 0,  -inv, -t*inv, 0,   inv, -t*inv, 0,
+        0, -inv,  t*inv,   0,  inv,  t*inv,  0, -inv, -t*inv,   0,  inv, -t*inv,
+         t*inv, 0, -inv,    t*inv, 0,  inv,   -t*inv, 0, -inv,   -t*inv, 0,  inv};
+    std::vector<uint16_t> idx = {
+        0,11,5, 0,5,1, 0,1,7, 0,7,10, 0,10,11, 1,5,9, 5,11,4, 11,10,2, 10,7,6, 7,1,8,
+        3,9,4, 3,4,2, 3,2,6, 3,6,8, 3,8,9, 4,9,5, 2,4,11, 6,2,10, 8,6,7, 9,8,1};
+    for (int s = 0; s < subdivisions; ++s) {
+        std::unordered_map<uint32_t, uint16_t> cache;
+        std::vector<uint16_t> out;
+        auto midpoint = [&](uint16_t a, uint16_t b) -> uint16_t {
+            uint32_t key = (a < b) ? ((uint32_t)a << 16 | b) : ((uint32_t)b << 16 | a);
+            auto it = cache.find(key);
+            if (it != cache.end()) return it->second;
+            float x = (v[a*3+0] + v[b*3+0]) * 0.5f;
+            float y = (v[a*3+1] + v[b*3+1]) * 0.5f;
+            float z = (v[a*3+2] + v[b*3+2]) * 0.5f;
+            float len = std::sqrt(x*x + y*y + z*z);
+            uint16_t id = (uint16_t)(v.size() / 3);
+            v.push_back(x/len); v.push_back(y/len); v.push_back(z/len);
+            cache.emplace(key, id);
+            return id;
+        };
+        for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+            uint16_t a = idx[i], b = idx[i+1], c = idx[i+2];
+            uint16_t ab = midpoint(a, b), bc = midpoint(b, c), ca = midpoint(c, a);
+            out.insert(out.end(), {a, ab, ca, b, bc, ab, c, ca, bc, ab, bc, ca});
+        }
+        idx.swap(out);
+    }
+    return {v, idx};
+}
+
+static bool create_geometry() {
+    MeshData mesh = make_icosphere(2);
+    g_index_count = (uint32_t)mesh.indices.size();
+    const VkDeviceSize vb_size = mesh.verts.size() * sizeof(float);
+    const VkDeviceSize ib_size = mesh.indices.size() * sizeof(uint16_t);
+    if (!create_upload_buffer(vb_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, g_vb, g_vb_mem)) return false;
+    if (!create_upload_buffer(ib_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, g_ib, g_ib_mem)) return false;
+    void* p = nullptr;
+    VK_CHECK(vkMapMemory(g_device, g_vb_mem, 0, vb_size, 0, &p));
+    memcpy(p, mesh.verts.data(), (size_t)vb_size);
+    vkUnmapMemory(g_device, g_vb_mem);
+    p = nullptr;
+    VK_CHECK(vkMapMemory(g_device, g_ib_mem, 0, ib_size, 0, &p));
+    memcpy(p, mesh.indices.data(), (size_t)ib_size);
+    vkUnmapMemory(g_device, g_ib_mem);
+    printf("[ASTRA] Geometry: icosphere %u indices\n", g_index_count);
+    return true;
+}
+
+// ─── Render pass (color + depth) ──────────────────────────────────────────────
+static bool create_render_pass() {
+    VkAttachmentDescription atts[2]{};
+    atts[0].format = g_sc_format;
+    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    atts[1].format = g_depth_format;
+    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
+    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference depth_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
     VkSubpassDescription sub{};
     sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &ref;
+    sub.pColorAttachments = &color_ref;
+    sub.pDepthStencilAttachment = &depth_ref;
 
     VkSubpassDependency dep{};
     dep.srcSubpass = VK_SUBPASS_EXTERNAL;
     dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
     dep.srcAccessMask = 0;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    ci.attachmentCount = 1;
-    ci.pAttachments = &att;
+    ci.attachmentCount = 2;
+    ci.pAttachments = atts;
     ci.subpassCount = 1;
     ci.pSubpasses = &sub;
     ci.dependencyCount = 1;
@@ -365,15 +565,15 @@ static bool create_render_pass() {
     return true;
 }
 
-// Create framebuffers
 static bool create_framebuffers() {
     g_framebuffers.resize(g_sc_views.size());
     for (size_t i = 0; i < g_sc_views.size(); i++) {
+        VkImageView atts[2] = {g_sc_views[i], g_depth_view};
         VkFramebufferCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         ci.renderPass = g_render_pass;
-        ci.attachmentCount = 1;
-        ci.pAttachments = &g_sc_views[i];
+        ci.attachmentCount = 2;
+        ci.pAttachments = atts;
         ci.width = g_sc_extent.width;
         ci.height = g_sc_extent.height;
         ci.layers = 1;
@@ -382,12 +582,11 @@ static bool create_framebuffers() {
     return true;
 }
 
-// Create command buffer (allocated from the SAME family the queue belongs to)
 static bool create_commands() {
     VkCommandPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    ci.queueFamilyIndex = g_gfx_family; // was hardcoded 0 — spec violation on some GPUs
+    ci.queueFamilyIndex = g_gfx_family;
     VK_CHECK(vkCreateCommandPool(g_device, &ci, nullptr, &g_cmd_pool));
 
     VkCommandBufferAllocateInfo ai{};
@@ -399,7 +598,6 @@ static bool create_commands() {
     return true;
 }
 
-// Create sync objects
 static bool create_sync() {
     VkSemaphoreCreateInfo si{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
@@ -409,85 +607,47 @@ static bool create_sync() {
     return true;
 }
 
-// ─── Graphics pipeline: fullscreen triangle, ASTRA state via push constants ───
-
-static VkShaderModule create_shader_module(const std::vector<uint32_t>& words) {
-    if (words.empty()) return VK_NULL_HANDLE;
-    VkShaderModuleCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ci.codeSize = words.size() * sizeof(uint32_t);
-    ci.pCode = words.data();
-    VkShaderModule module = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(g_device, &ci, nullptr, &module) != VK_SUCCESS) {
-        return VK_NULL_HANDLE;
-    }
-    return module;
-}
-
-static bool load_shader(const char* name, std::vector<uint32_t>& out) {
-    // Search order: <exe>/shaders, CWD/shaders, <exe>, CWD.
-    const std::string dir = exe_dir();
-    const std::string bases[] = {
-        dir + "\\shaders\\",
-        ".\\shaders\\",
-        dir + "\\",
-        ".\\"
-    };
-    for (const auto& base : bases) {
-        const std::string path = base + name;
-        if (read_spirv(path, out)) {
-            printf("[ASTRA] Shader loaded: %s\n", path.c_str());
-            return true;
-        }
-    }
-    printf("[ASTRA] Missing shader %s — expected shaders\\%s next to ASTRA COSMOS.exe\n", name, name);
-    return false;
-}
-
-static bool create_pipeline() {
-    std::vector<uint32_t> vert_spv, frag_spv;
-    if (!load_shader("astra.vert.spv", vert_spv)) return false;
-    if (!load_shader("astra.frag.spv", frag_spv)) return false;
-
-    g_vert_module = create_shader_module(vert_spv);
-    g_frag_module = create_shader_module(frag_spv);
-    if (!g_vert_module || !g_frag_module) {
-        printf("[ASTRA] vkCreateShaderModule failed\n");
-        return false;
-    }
-
-    // Push constants MUST match src/shaders/astra.frag exactly:
-    //   float sim_time; float width; float height; float frame;  (16 bytes)
-    VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    pcr.offset = 0;
-    pcr.size = 4 * sizeof(float);
-
-    VkPipelineLayoutCreateInfo pli{};
-    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pli.pushConstantRangeCount = 1;
-    pli.pPushConstantRanges = &pcr;
-    VK_CHECK(vkCreatePipelineLayout(g_device, &pli, nullptr, &g_pipeline_layout));
+// ─── Pipelines (shared 128-byte push-constant layout) ─────────────────────────
+static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* fs, size_t fs_words,
+                          VkPrimitiveTopology topo, bool depth_test, bool depth_write,
+                          bool with_vertex_input, VkPipeline& out) {
+    VkShaderModule vm = create_shader_module(std::vector<uint32_t>(vs, vs + vs_words));
+    VkShaderModule fm = create_shader_module(std::vector<uint32_t>(fs, fs + fs_words));
+    if (!vm || !fm) { printf("[ASTRA] shader module failed\n"); return false; }
 
     VkPipelineShaderStageCreateInfo stages[2]{};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = g_vert_module;
+    stages[0].module = vm;
     stages[0].pName = "main";
     stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = g_frag_module;
+    stages[1].module = fm;
     stages[1].pName = "main";
 
-    // No vertex buffers — astra.vert generates the fullscreen triangle from gl_VertexIndex.
+    VkVertexInputBindingDescription binding{};
+    binding.binding = 0;
+    binding.stride = 3 * sizeof(float);
+    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription attr{};
+    attr.location = 0;
+    attr.binding = 0;
+    attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+    attr.offset = 0;
+
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    if (with_vertex_input) {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &binding;
+        vi.vertexAttributeDescriptionCount = 1;
+        vi.pVertexAttributeDescriptions = &attr;
+    }
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
     ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    ia.topology = topo;
 
-    // Dynamic viewport/scissor — swapchain recreation needs no pipeline rebuild.
     VkPipelineViewportStateCreateInfo vp{};
     vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vp.viewportCount = 1;
@@ -504,6 +664,14 @@ static bool create_pipeline() {
     ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = depth_test ? VK_TRUE : VK_FALSE;
+    ds.depthWriteEnable = depth_write ? VK_TRUE : VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    ds.depthBoundsTestEnable = VK_FALSE;
+    ds.stencilTestEnable = VK_FALSE;
+
     VkPipelineColorBlendAttachmentState cba{};
     cba.blendEnable = VK_FALSE;
     cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -514,10 +682,10 @@ static bool create_pipeline() {
     cb.pAttachments = &cba;
 
     const VkDynamicState dyn_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo ds{};
-    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    ds.dynamicStateCount = 2;
-    ds.pDynamicStates = dyn_states;
+    VkPipelineDynamicStateCreateInfo dy{};
+    dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn_states;
 
     VkGraphicsPipelineCreateInfo gp{};
     gp.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -528,63 +696,183 @@ static bool create_pipeline() {
     gp.pViewportState = &vp;
     gp.pRasterizationState = &rs;
     gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
     gp.pColorBlendState = &cb;
-    gp.pDynamicState = &ds;
+    gp.pDynamicState = &dy;
     gp.layout = g_pipeline_layout;
     gp.renderPass = g_render_pass;
     gp.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &gp, nullptr, &g_graphics_pipeline));
-
-    printf("[ASTRA] Graphics pipeline created (fullscreen triangle + push constants)\n");
+    VkResult res = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &gp, nullptr, &out);
+    vkDestroyShaderModule(g_device, vm, nullptr);
+    vkDestroyShaderModule(g_device, fm, nullptr);
+    if (res != VK_SUCCESS) { printf("[ASTRA] vkCreateGraphicsPipelines failed: %d\n", (int)res); return false; }
     return true;
 }
 
-// ─── Swapchain recreation (resize / OUT_OF_DATE / SUBOPTIMAL) ────────────────
+static bool create_pipelines() {
+    // One layout: 128-byte push-constant range used by bg/mesh/orbit draws.
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.offset = 0;
+    pcr.size = 128;
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    VK_CHECK(vkCreatePipelineLayout(g_device, &pli, nullptr, &g_pipeline_layout));
+
+    std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f;
+    if (!load_shader("astra.vert.spv", astra_v)) return false;
+    if (!load_shader("astra.frag.spv", astra_f)) return false;
+    if (!load_shader("sphere.vert.spv", sphere_v)) return false;
+    if (!load_shader("sphere.frag.spv", sphere_f)) return false;
+    if (!load_shader("orbit.vert.spv", orbit_v)) return false;
+    if (!load_shader("orbit.frag.spv", orbit_f)) return false;
+
+    if (!make_pipeline(astra_v.data(), astra_v.size(), astra_f.data(), astra_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false, g_pipe_bg)) return false;
+    if (!make_pipeline(sphere_v.data(), sphere_v.size(), sphere_f.data(), sphere_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, true, true, g_pipe_mesh)) return false;
+    if (!make_pipeline(orbit_v.data(), orbit_v.size(), orbit_f.data(), orbit_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, false, g_pipe_orbit)) return false;
+
+    printf("[ASTRA] Pipelines created: background + bodies + orbit overlays\n");
+    return true;
+}
+
+// ─── Simulation → RenderState → draw data ─────────────────────────────────────
+static float visual_radius_units(const astra::app::CelestialBody& b) {
+    // Sublinear radius exaggeration — CINEMATIC visualization transform only;
+    // scientific state keeps true SI values (see title-bar inspector).
+    double rv = std::pow(b.radius_km / astra::app::R_EARTH_KM, 0.35) * 1.6;
+    if (rv < 0.9) rv = 0.9;
+    return (float)rv;
+}
+
+static astra::app::Mat4 model_of(float px, float py, float pz, float s) {
+    astra::app::Mat4 m = astra::app::Mat4::identity();
+    m.m[0] = s; m.m[5] = s; m.m[10] = s;
+    m.m[12] = px; m.m[13] = py; m.m[14] = pz;
+    return m;
+}
+
+static void sim_tick(double real_dt_s) {
+    g_clock.advance(real_dt_s);
+    g_world = astra::app::propagate_world(g_bodies, g_clock.sim_time_s);
+
+    // Keep the ASTRA RenderState binding truthful (double authority).
+    g_scene.state.sim_time_s = g_clock.sim_time_s;
+    g_scene.state.tick = g_frame_count;
+    g_scene.state.objects.clear();
+    g_scene.state.objects.reserve(g_bodies.size());
+    for (size_t i = 0; i < g_bodies.size(); ++i) {
+        const char* kind = g_bodies[i].kind == astra::app::BodyKind::STAR ? "STAR"
+                         : g_bodies[i].kind == astra::app::BodyKind::PLANET ? "PLANET" : "MOON";
+        g_scene.state.objects.push_back(
+            {g_bodies[i].name, kind,
+             {g_world[i][0], g_world[i][1], g_world[i][2]},
+             "heliocentric", "DATA-DERIVED/SIMULATED", 0,
+             (float)g_bodies[i].mass_kg, 0});
+    }
+}
+
+static void focus_body(int idx, bool reset_view) {
+    if (g_bodies.empty()) return;
+    g_focus = ((idx % (int)g_bodies.size()) + (int)g_bodies.size()) % (int)g_bodies.size();
+    if (reset_view) {
+        g_camera.distance = visual_radius_units(g_bodies[(size_t)g_focus]) * 14.0;
+        g_camera.clamp_distance(6.0, 6000.0);
+    }
+}
+
+static void update_camera_from_input() {
+    const double rot = 0.06;
+    double daz = 0.0, del = 0.0;
+    if (g_keys[VK_LEFT])  daz -= rot;
+    if (g_keys[VK_RIGHT]) daz += rot;
+    if (g_keys[VK_UP])    del += rot * 0.6;
+    if (g_keys[VK_DOWN])  del -= rot * 0.6;
+    if (daz != 0.0 || del != 0.0) g_camera.rotate(daz, del);
+    if (g_keys[VK_PRIOR]) g_camera.zoom(1.10);  // PgUp
+    if (g_keys[VK_NEXT])  g_camera.zoom(1.0 / 1.10); // PgDn
+    g_camera.clamp_distance(2.0, 20000.0);
+}
+
+static void update_inspector_title(double fps) {
+    const auto& b = g_bodies[(size_t)g_focus];
+    const astra::app::Vec3d& w = g_world[(size_t)g_focus];
+    const double r_helio = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+    // Vis-viva speed (SIMULATED, from the same elements/mu as the positions).
+    const double a = b.elements.a_km;
+    const double mu = b.elements.mu;
+    double speed = 0.0;
+    if (a > 0.0) speed = std::sqrt(std::max(0.0, mu * (2.0 / r_helio - 1.0 / a)));
+    const double years = g_clock.sim_time_s / astra::app::DAY_S / astra::app::YEAR_D;
+    char title[512];
+    snprintf(title, sizeof(title),
+        "ASTRA COSMOS v0.2 — %s | r=%.4f AU v=%.2f km/s | epoch J2000%+.2f yr | warp x%.0f %s | %.0f fps | %s",
+        b.name.c_str(), r_helio / astra::app::AU_KM, speed, years, g_clock.warp,
+        g_clock.paused ? "PAUSED" : "", fps,
+        "SIMULATED (Kepler, JPL approx. elements)");
+    SetWindowTextA(g_hwnd, title);
+}
+
+void dump_inspector() {
+    printf("\n[ASTRA] ═══ OBJECT INSPECTOR (epoch J2000 %+.3f yr) ═══\n",
+           g_clock.sim_time_s / astra::app::DAY_S / astra::app::YEAR_D);
+    for (size_t i = 0; i < g_bodies.size(); ++i) {
+        const auto& b = g_bodies[i];
+        const astra::app::Vec3d& w = g_world[i];
+        const double r_helio = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+        printf("  %-8s r=%10.4f AU  m=%.3e kg  R=%.0f km  %s %s\n",
+               b.name.c_str(), r_helio / astra::app::AU_KM, b.mass_kg, b.radius_km,
+               b.kind == astra::app::BodyKind::STAR ? "★" : (b.kind == astra::app::BodyKind::MOON ? "☾" : "●"),
+               b.classification.c_str());
+    }
+    printf("[ASTRA] classifications: DATA-DERIVED inputs · SIMULATED Kepler propagation · CINEMATIC visual scaling\n");
+}
+
+// ─── Swapchain recreation ─────────────────────────────────────────────────────
+static void destroy_swapchain_depth() {
+    if (g_depth_view) { vkDestroyImageView(g_device, g_depth_view, nullptr); g_depth_view = VK_NULL_HANDLE; }
+    if (g_depth_img) { vkDestroyImage(g_device, g_depth_img, nullptr); g_depth_img = VK_NULL_HANDLE; }
+    if (g_depth_mem) { vkFreeMemory(g_device, g_depth_mem, nullptr); g_depth_mem = VK_NULL_HANDLE; }
+}
 
 static bool recreate_swapchain() {
     g_swapchain_dirty = false;
-    if (g_width == 0 || g_height == 0 || g_minimized) return true; // wait for restore
+    if (g_width == 0 || g_height == 0 || g_minimized) return true;
 
     vkDeviceWaitIdle(g_device);
-
     for (auto fb : g_framebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
     g_framebuffers.clear();
     for (auto v : g_sc_views) vkDestroyImageView(g_device, v, nullptr);
     g_sc_views.clear();
-    if (g_swapchain != VK_NULL_HANDLE) {
-        vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
-        g_swapchain = VK_NULL_HANDLE;
-    }
+    destroy_swapchain_depth();
+    if (g_swapchain != VK_NULL_HANDLE) { vkDestroySwapchainKHR(g_device, g_swapchain, nullptr); g_swapchain = VK_NULL_HANDLE; }
 
     if (!create_swapchain()) return false;
+    if (!create_depth()) return false;
     if (!create_framebuffers()) return false;
     printf("[ASTRA] Swapchain recreated for %ux%u\n", g_sc_extent.width, g_sc_extent.height);
     return true;
 }
 
 // ─── Frame rendering ──────────────────────────────────────────────────────────
-
-static bool render_frame() {
-    if (g_width == 0 || g_height == 0 || g_minimized) {
-        Sleep(16); // minimized — idle instead of spinning the GPU
-        return true;
-    }
+static bool render_frame(double fps) {
+    if (g_width == 0 || g_height == 0 || g_minimized) { Sleep(16); return true; }
     if (g_swapchain_dirty && !recreate_swapchain()) return false;
 
     vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
 
     uint32_t img_idx = 0;
-    VkResult acquire = vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX,
-                                             g_img_sem, VK_NULL_HANDLE, &img_idx);
-    if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
-        g_swapchain_dirty = true; // fence still signaled — safe to retry next frame
-        return true;
-    }
+    VkResult acquire = vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, g_img_sem, VK_NULL_HANDLE, &img_idx);
+    if (acquire == VK_ERROR_OUT_OF_DATE_KHR) { g_swapchain_dirty = true; return true; }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
         printf("[ASTRA] vkAcquireNextImageKHR failed: %d\n", (int)acquire);
         return false;
     }
-    if (acquire == VK_SUBOPTIMAL_KHR) g_swapchain_dirty = true; // draw once, then recreate
+    if (acquire == VK_SUBOPTIMAL_KHR) g_swapchain_dirty = true;
 
     vkResetFences(g_device, 1, &g_fence);
     vkResetCommandBuffer(g_cmd_buf, 0);
@@ -594,9 +882,9 @@ static bool render_frame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cmd_buf, &bi);
 
-    // Dark clear; the fragment shader paints the animated deep-space glow + grid.
-    VkClearValue clear{};
-    clear.color = {{0.005f, 0.005f, 0.012f, 1.0f}};
+    VkClearValue clears[2]{};
+    clears[0].color = {{0.004f, 0.004f, 0.010f, 1.0f}};
+    clears[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -604,28 +892,85 @@ static bool render_frame() {
     rp.framebuffer = g_framebuffers[img_idx];
     rp.renderArea.offset = {0, 0};
     rp.renderArea.extent = g_sc_extent;
-    rp.clearValueCount = 1;
-    rp.pClearValues = &clear;
+    rp.clearValueCount = 2;
+    rp.pClearValues = clears;
     vkCmdBeginRenderPass(g_cmd_buf, &rp, VK_SUBPASS_CONTENTS_INLINE);
-
-    vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_graphics_pipeline);
 
     VkViewport viewport{0.0f, 0.0f, (float)g_sc_extent.width, (float)g_sc_extent.height, 0.0f, 1.0f};
     vkCmdSetViewport(g_cmd_buf, 0, 1, &viewport);
     VkRect2D scissor{{0, 0}, g_sc_extent};
     vkCmdSetScissor(g_cmd_buf, 0, 1, &scissor);
 
-    // THE BINDING: ASTRA scientific state → GPU push constants (layout per astra.frag).
-    const float pc[4] = {
-        (float)g_scene.state.sim_time_s,   // authoritative sim clock
-        (float)g_sc_extent.width,
-        (float)g_sc_extent.height,
-        (float)g_frame_count
-    };
-    vkCmdPushConstants(g_cmd_buf, g_pipeline_layout,
-                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), pc);
+    // ── 4-float background constants (sim time feeds shader twinkle) ──
+    const astra::app::Vec3d& target = g_world[(size_t)g_focus];
+    const float aspect = (float)g_sc_extent.width / (float)g_sc_extent.height;
+    const astra::app::Mat4 proj = g_camera.projection(aspect);
+    const astra::app::Mat4 view = g_camera.view();
+    const astra::app::Mat4 view_proj = astra::app::Mat4::multiply(proj, view);
 
-    vkCmdDraw(g_cmd_buf, 3, 1, 0, 0); // fullscreen triangle
+    // ── 1. Background pass ──
+    vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_bg);
+    const float bg_pc[8] = {(float)g_clock.sim_time_s, (float)g_sc_extent.width,
+                            (float)g_sc_extent.height, (float)g_frame_count, 0, 0, 0, 0};
+    vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, 16, bg_pc);
+    vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
+
+    // Render-space positions (floating origin at the camera target).
+    std::vector<std::array<float,3>> rpos(g_bodies.size());
+    for (size_t i = 0; i < g_bodies.size(); ++i) {
+        rpos[i] = {(float)((g_world[i][0] - target[0]) * POS_SCALE),
+                   (float)((g_world[i][1] - target[1]) * POS_SCALE),
+                   (float)((g_world[i][2] - target[2]) * POS_SCALE)};
+    }
+
+    // ── 2. Celestial bodies (indexed draws, per-body push constants) ──
+    vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_mesh);
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_vb, &zero);
+    vkCmdBindIndexBuffer(g_cmd_buf, g_ib, 0, VK_INDEX_TYPE_UINT16);
+    struct BodyPC { astra::app::Mat4 mvp; float bodyPosRad[4]; float sunPosEmis[4]; float color[4]; };
+    const float sunx = rpos[0][0], suny = rpos[0][1], sunz = rpos[0][2];
+    for (size_t i = 0; i < g_bodies.size(); ++i) {
+        const float r = visual_radius_units(g_bodies[i]);
+        BodyPC pc{};
+        pc.mvp = astra::app::Mat4::multiply(view_proj, model_of(rpos[i][0], rpos[i][1], rpos[i][2], r));
+        pc.bodyPosRad[0] = rpos[i][0]; pc.bodyPosRad[1] = rpos[i][1]; pc.bodyPosRad[2] = rpos[i][2]; pc.bodyPosRad[3] = r;
+        pc.sunPosEmis[0] = sunx; pc.sunPosEmis[1] = suny; pc.sunPosEmis[2] = sunz;
+        pc.sunPosEmis[3] = (g_bodies[i].kind == astra::app::BodyKind::STAR) ? 1.0f : 0.0f;
+        pc.color[0] = g_bodies[i].color[0]; pc.color[1] = g_bodies[i].color[1]; pc.color[2] = g_bodies[i].color[2]; pc.color[3] = 1.0f;
+        vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDrawIndexed(g_cmd_buf, g_index_count, 1, 0, 0, 0);
+    }
+
+    // ── 3. Orbit overlays (Kepler evaluated in-shader from real elements) ──
+    if (g_bodies.size() > 1) {
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_orbit);
+        struct OrbitPC { astra::app::Mat4 viewProj; float e1[4]; float e2[4]; float parent[4]; float color[4]; };
+        for (size_t i = 1; i < g_bodies.size(); ++i) {
+            const auto& b = g_bodies[i];
+            const auto& el = b.elements;
+            OrbitPC pc{};
+            pc.viewProj = view_proj;
+            pc.e1[0] = (float)el.a_km; pc.e1[1] = (float)el.e; pc.e1[2] = (float)el.i; pc.e1[3] = (float)el.raan;
+            const double n = astra::app::mean_motion(el);
+            const double two_pi = 6.283185307179586476925;
+            double M = std::fmod(el.M0 + n * (g_clock.sim_time_s - el.epoch_s), two_pi);
+            if (M < 0.0) M += two_pi;
+            pc.e2[0] = (float)el.argp; pc.e2[1] = (float)M; pc.e2[2] = (float)POS_SCALE; pc.e2[3] = 0.0f;
+            const auto& pw = rpos[(size_t)b.parent >= 0 ? (size_t)b.parent : 0];
+            pc.parent[0] = pw[0]; pc.parent[1] = pw[1]; pc.parent[2] = pw[2]; pc.parent[3] = 0.0f;
+            const bool focused = ((int)i == g_focus);
+            pc.color[0] = g_bodies[i].color[0] * (focused ? 1.0f : 0.45f);
+            pc.color[1] = g_bodies[i].color[1] * (focused ? 1.0f : 0.45f);
+            pc.color[2] = g_bodies[i].color[2] * (focused ? 1.0f : 0.45f);
+            pc.color[3] = 1.0f;
+            vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDraw(g_cmd_buf, 128, 1, 0, 0);
+        }
+    }
 
     vkCmdEndRenderPass(g_cmd_buf);
     vkEndCommandBuffer(g_cmd_buf);
@@ -656,16 +1001,24 @@ static bool render_frame() {
         printf("[ASTRA] vkQueuePresentKHR failed: %d\n", (int)presented);
         return false;
     }
+    (void)fps;
     return true;
 }
 
-// Cleanup
+// ─── Cleanup ──────────────────────────────────────────────────────────────────
 static void cleanup() {
     if (g_device) vkDeviceWaitIdle(g_device);
-    if (g_graphics_pipeline) vkDestroyPipeline(g_device, g_graphics_pipeline, nullptr);
+    if (g_pipe_bg) vkDestroyPipeline(g_device, g_pipe_bg, nullptr);
+    if (g_pipe_mesh) vkDestroyPipeline(g_device, g_pipe_mesh, nullptr);
+    if (g_pipe_orbit) vkDestroyPipeline(g_device, g_pipe_orbit, nullptr);
     if (g_pipeline_layout) vkDestroyPipelineLayout(g_device, g_pipeline_layout, nullptr);
     if (g_vert_module) vkDestroyShaderModule(g_device, g_vert_module, nullptr);
     if (g_frag_module) vkDestroyShaderModule(g_device, g_frag_module, nullptr);
+    if (g_vb) vkDestroyBuffer(g_device, g_vb, nullptr);
+    if (g_vb_mem) vkFreeMemory(g_device, g_vb_mem, nullptr);
+    if (g_ib) vkDestroyBuffer(g_device, g_ib, nullptr);
+    if (g_ib_mem) vkFreeMemory(g_device, g_ib_mem, nullptr);
+    destroy_swapchain_depth();
     if (g_img_sem) vkDestroySemaphore(g_device, g_img_sem, nullptr);
     if (g_render_sem) vkDestroySemaphore(g_device, g_render_sem, nullptr);
     if (g_fence) vkDestroyFence(g_device, g_fence, nullptr);
@@ -680,32 +1033,38 @@ static void cleanup() {
     printf("[ASTRA] Clean shutdown\n");
 }
 
-// Main entry point
+// ─── Entry point ──────────────────────────────────────────────────────────────
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
-    printf("[ASTRA] ASTRA COSMOS v0.1 — Real Vulkan pipeline\n");
+    printf("[ASTRA] ASTRA COSMOS v0.2 — Integrated scientific simulation\n");
 
-    if (!create_window()) { printf("[ASTRA] Window failed\n"); return 1; }
-    if (!create_instance()) { printf("[ASTRA] Instance failed\n"); cleanup(); return 1; }
-    if (!create_surface()) { printf("[ASTRA] Surface failed\n"); cleanup(); return 1; }
-    if (!create_device()) { printf("[ASTRA] Device failed\n"); cleanup(); return 1; }
-    if (!create_swapchain()) { printf("[ASTRA] Swapchain failed\n"); cleanup(); return 1; }
-    if (!create_render_pass()) { printf("[ASTRA] Render pass failed\n"); cleanup(); return 1; }
-    if (!create_framebuffers()) { printf("[ASTRA] Framebuffers failed\n"); cleanup(); return 1; }
-    if (!create_commands()) { printf("[ASTRA] Commands failed\n"); cleanup(); return 1; }
-    if (!create_sync()) { printf("[ASTRA] Sync failed\n"); cleanup(); return 1; }
-    if (!create_pipeline()) { printf("[ASTRA] Pipeline failed\n"); cleanup(); return 1; }
+    // Scientific scenario (Python engine remains the authority; this native
+    // mirror reproduces astra.orbital exactly — see app/celestial_sim.h).
+    g_bodies = astra::app::make_solar_system();
+    g_world = astra::app::propagate_world(g_bodies, g_clock.sim_time_s);
+    focus_body(3, true); // Earth
+    printf("[ASTRA] Scenario: solar system (%zu bodies, epoch J2000, Kepler two-body)\n", g_bodies.size());
 
-    // Initialize ASTRA engine
-    g_scene.state.tick = 0;
-    g_scene.state.sim_time_s = 0.0;
-    g_scene.state.objects.push_back({"sol", "STAR", {0,0,0}, "world", "REAL", 0, 1.989e30f, 0});
-    printf("[ASTRA] Scientific engine initialized\n");
-    printf("[ASTRA] Entering persistent loop — ESC to exit\n");
+    if (!create_window())     { printf("[ASTRA] Window failed\n"); return 1; }
+    if (!create_instance())   { printf("[ASTRA] Instance failed\n"); cleanup(); return 1; }
+    if (!create_surface())    { printf("[ASTRA] Surface failed\n"); cleanup(); return 1; }
+    if (!create_device())     { printf("[ASTRA] Device failed\n"); cleanup(); return 1; }
+    if (!create_swapchain())  { printf("[ASTRA] Swapchain failed\n"); cleanup(); return 1; }
+    if (!create_depth())      { printf("[ASTRA] Depth failed\n"); cleanup(); return 1; }
+    if (!create_render_pass()){ printf("[ASTRA] Render pass failed\n"); cleanup(); return 1; }
+    if (!create_framebuffers()){ printf("[ASTRA] Framebuffers failed\n"); cleanup(); return 1; }
+    if (!create_commands())   { printf("[ASTRA] Commands failed\n"); cleanup(); return 1; }
+    if (!create_sync())       { printf("[ASTRA] Sync failed\n"); cleanup(); return 1; }
+    if (!create_geometry())   { printf("[ASTRA] Geometry failed\n"); cleanup(); return 1; }
+    if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    auto t_start = std::chrono::high_resolution_clock::now();
+    printf("[ASTRA] Controls: arrows orbit | PgUp/PgDn zoom | Tab body | +/- warp | Space pause | F1 inspector | ESC quit\n");
+    dump_inspector();
+
+    auto t_prev = std::chrono::high_resolution_clock::now();
+    double fps = 0.0;
 
     // ═══ PERSISTENT MAIN LOOP ═══
     while (!g_quit) {
@@ -717,25 +1076,31 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         }
         if (g_quit) break;
 
-        // Update ASTRA scientific state
         auto t_now = std::chrono::high_resolution_clock::now();
-        float sim_time = std::chrono::duration<float>(t_now - t_start).count();
-        g_scene.state.sim_time_s = sim_time;
-        g_scene.state.tick = g_frame_count;
+        double real_dt = std::chrono::duration<double>(t_now - t_prev).count();
+        if (real_dt > 0.25) real_dt = 0.25; // avoid spiral after breakpoints
+        t_prev = t_now;
+        if (real_dt > 1e-6) fps = 0.9 * fps + 0.1 * (1.0 / real_dt);
 
-        if (!render_frame()) {
+        update_camera_from_input();
+        sim_tick(real_dt);
+        update_inspector_title(fps);
+
+        if (!render_frame(fps)) {
             printf("[ASTRA] Render failed\n");
             break;
         }
 
         g_frame_count++;
         if (g_frame_count % 300 == 0) {
-            printf("[ASTRA] frame=%llu sim_time=%.1fs extent=%ux%u\n",
-                (unsigned long long)g_frame_count, sim_time,
-                g_sc_extent.width, g_sc_extent.height);
+            printf("[ASTRA] frame=%llu sim=%+.3f yr warp=x%.0f focus=%s fps=%.0f\n",
+                (unsigned long long)g_frame_count,
+                g_clock.sim_time_s / astra::app::DAY_S / astra::app::YEAR_D,
+                g_clock.warp, g_bodies[(size_t)g_focus].name.c_str(), fps);
         }
     }
 
+    g_clock.paused = true;
     printf("[ASTRA] Shutting down after %llu frames\n", (unsigned long long)g_frame_count);
     cleanup();
     return 0;
