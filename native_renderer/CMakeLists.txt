@@ -244,6 +244,11 @@ if(GLSLANG_VALIDATOR)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/orbit.vert"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/orbit.frag"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/vector.vert"
+        # v0.5 real-rendering additions (instancing / culling / HDR post).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/cull.comp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/post_bright.frag"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/post_blur.frag"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/post_composite.frag"
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})

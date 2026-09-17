@@ -205,14 +205,20 @@ elements, procedural starfield background, floating-origin camera.
   `W A S D Q E` = FREE-camera move (SHIFT/PgUp fast, PgDn slow) · `+` / `-` = warp ×2/÷2 · `0`–`8` = warp presets (1×…1e8×) ·
   Space = pause · `.` = sim step · Backspace = epoch reset (J2000) · F5 = scenario restart · **F2 = save scenario, F3 = load scenario** (path-safe,
   `<exe>/saves/scenario_1.json`) · V = velocity-vector overlay · `P` = peri/apo apsis markers · Home = reset view ·
-  F1 = scientific HUD matrix + inspector · ESC = quit. (Reverse time is intentionally not offered: the mirrored
-  scientific authority does not define it.)
+  **`[` / `]` = HD exposure down/up (CINEMATIC display param)** · F1 = scientific HUD matrix + inspector · ESC = quit.
+  (Reverse time is intentionally not offered: the mirrored scientific authority does not define it.)
 - **v0.4 additions**: scientific HUD data model with explicit `NOT AVAILABLE` rows (title bar + F1 matrix; on-canvas
   text planned); selection decoupled from camera target with one authoritative `selected_id`; star color consumed from
   the project LUT (`native_renderer/assets/star_temperature_lut.ppm`, blackbody approximation 2000–40000 K — labeled
   interpretation, not photometry); classified Cosmic-Audio event bus (UI/sim = CINEMATIC by default; vacuum acoustics
   and source-less sonification rejected by policy; audible output pending Windows audio run); traversal-safe scenario
   persistence with strict parsing (unknown/missing keys fail the load).
+- **v0.5 real rendering (see `ASTRA_V0_5_REPORT.md`)**: 16-bit-float HDR scene target (capability-checked, explicit
+  failure — no silent 8-bit fallback) → bloom (bright-pass, separable blur H/V) → ACES-approx composite with `[`/`]`
+  exposure on an SRGB swapchain; instanced bodies (one 32 B/record SSBO, two batched LOD draws) with GPU compute
+  visibility/LOD classification (deterministic per-slot mask; CPU policy twin under 2984-check gates); renderer
+  telemetry (real CPU timings, draw/instance/LOD counts) in the title bar and F1. GPU/Windows runtime: NOT VERIFIED
+  in this environment — statuses are precisely labeled.
 - **Inspector**: the title bar always shows focus body, true SI heliocentric distance (AU),
   vis-viva speed (km/s), epoch (J2000 + years), warp, and the classification tag
   (`SIMULATED (Kepler, JPL approx. elements)`). CINEMATIC visual scaling (sublinear

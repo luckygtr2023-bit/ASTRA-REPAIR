@@ -1,0 +1,41 @@
+#version 450
+// ASTRA COSMOS v0.5 — GPU visibility / LOD classification.
+// Writes a DETERMINISTIC per-body slot (no atomics, no compaction order):
+// mask[i] = 0 (invisible) | 1 (LOW-LOD batch) | 2 (HIGH-LOD batch).
+// The rule is the float mirror of app/render_math.cpp (documented policy).
+// Visibility affects ONLY visualization draws; scientific state untouched.
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform CullPC {
+    mat4 viewProj;
+    vec4 params;  // x = body count, y = tan(half FOV)
+    vec4 eye;     // xyz = camera eye in render (target-relative) units
+} pc;
+
+struct BodyInstance { vec4 pos_radius; vec4 color_flag; };
+layout(std430, binding = 0) readonly buffer Instances { BodyInstance inst[]; };
+layout(std430, binding = 1) writeonly buffer LodMask { uint mask[]; };
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.params.x)) return;
+    vec3 c = inst[i].pos_radius.xyz;
+    float r = inst[i].pos_radius.w;
+    vec4 clip = pc.viewProj * vec4(c, 1.0);
+    uint lod = 0;
+    if (clip.w > 0.0) {
+        // projective AABB test: |x| < w + r*|colx|, etc. (sphere vs frustum;
+        // equivalent to CPU mirror plane test for this perspective matrix)
+        float rx = length(vec3(pc.viewProj[0][0], pc.viewProj[0][1], pc.viewProj[0][2]));
+        float ry = length(vec3(pc.viewProj[1][0], pc.viewProj[1][1], pc.viewProj[1][2]));
+        float rz = length(vec3(pc.viewProj[2][0], pc.viewProj[2][1], pc.viewProj[2][2]));
+        if (abs(clip.x) < clip.w + r * rx && abs(clip.y) < clip.w + r * ry &&
+            clip.z > -r * rz && clip.z < clip.w + r * rz) {
+            float dist = max(length(c - pc.eye.xyz), 1e-4);  // camera-relative distance
+            float frac = r / (dist * pc.params.y);           // screen-height fraction
+            lod = (frac > 0.010) ? 2u : 1u;                  // mirror of lod_select()
+        }
+    }
+    mask[i] = lod;
+}

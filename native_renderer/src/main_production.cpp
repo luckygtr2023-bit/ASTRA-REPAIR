@@ -1,15 +1,28 @@
-// ASTRA COSMOS — Production Win32 + Vulkan application (v0.4 Integrated Simulation)
+// ASTRA COSMOS — Production Win32 + Vulkan application (v0.5 REAL RENDERING)
 //
 // One integrated application: the scientific simulation (mirror of the Python
 // authority astra.orbital) drives RenderState; the renderer consumes it every
 // frame. No mock Vulkan. Positions/times are simulated truthfully in double
 // precision and rebased to renderer floats only at the visualization boundary.
 //
+// v0.5 real-rendering pipeline (all paths genuine, GPU-executed):
+//   HDR scene pass (R16G16B16A16_SFLOAT + depth, capability-gated, explicit
+//   failure — no silent 8-bit fallback) -> bright-pass -> separable blur H/V
+//   -> composite (ACES-approx display transform + exposure) -> SRGB swapchain
+//   (hardware sRGB conversion; no manual gamma duplication).
+//   Instancing: all bodies in ONE instance SSBO (32B/record, RenderState-
+//   derived), TWO vkCmdDrawIndexed calls per frame (LOW + HIGH LOD batches).
+//   Visibility/LOD: real compute dispatch writing a deterministic per-body
+//   mask slot (same rule as app/render_math CPU twin; zero-host-read; host
+//   reads the mask +1 frame solely for the HUD counters).
+//   LOD: subdivision-1 (240 idx) vs subdivision-2 (960 idx) icospheres chosen
+//   by screen-height fraction (documented threshold 1%, FOV-dependent).
+//
 // Controls (keyboard, see README):
 //   Arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect
 //   O free/follow cam | WASDQE move | +/- warp | 0-8 presets | Space pause
 //   . step | BKSP epoch-reset | F5 restart | F2/F3 save/load | V vectors
-//   P apsis markers | F1 HUD+inspector | ESC quit
+//   P apsis markers | [ ] exposure | F1 HUD+inspector | ESC quit
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -37,6 +50,7 @@
 #include "app/audio_bus.h"
 #include "app/persist.h"
 #include "app/star_lut.h"
+#include "app/render_math.h"
 
 // ─── Application state ────────────────────────────────────────────────────────
 static std::vector<astra::app::CelestialBody> g_bodies;
@@ -82,8 +96,7 @@ static VkFormat g_sc_format = VK_FORMAT_UNDEFINED;
 static VkExtent2D g_sc_extent = {};
 static std::vector<VkImage> g_sc_images;
 static std::vector<VkImageView> g_sc_views;
-static VkRenderPass g_render_pass = VK_NULL_HANDLE;
-static std::vector<VkFramebuffer> g_framebuffers;
+static std::vector<VkFramebuffer> g_framebuffers; // present-pass framebuffers (one per swapchain image)
 static VkCommandPool g_cmd_pool = VK_NULL_HANDLE;
 static VkCommandBuffer g_cmd_buf = VK_NULL_HANDLE;
 static VkSemaphore g_img_sem = VK_NULL_HANDLE;
@@ -96,21 +109,86 @@ static VkDeviceMemory g_depth_mem = VK_NULL_HANDLE;
 static VkImageView g_depth_view = VK_NULL_HANDLE;
 static VkFormat g_depth_format = VK_FORMAT_D32_SFLOAT;
 
-// Geometry (unit icosphere, shared by every body draw)
-static VkBuffer g_vb = VK_NULL_HANDLE;
-static VkDeviceMemory g_vb_mem = VK_NULL_HANDLE;
-static VkBuffer g_ib = VK_NULL_HANDLE;
-static VkDeviceMemory g_ib_mem = VK_NULL_HANDLE;
-static uint32_t g_index_count = 0;
+// v0.5 LOD geometry: LOW = icosphere subdivision 1, HIGH = subdivision 2.
+static VkBuffer g_vb_low = VK_NULL_HANDLE, g_vb_high = VK_NULL_HANDLE;
+static VkDeviceMemory g_vb_mem_low = VK_NULL_HANDLE, g_vb_mem_high = VK_NULL_HANDLE;
+static VkBuffer g_ib_low = VK_NULL_HANDLE, g_ib_high = VK_NULL_HANDLE;
+static VkDeviceMemory g_ib_mem_low = VK_NULL_HANDLE, g_ib_mem_high = VK_NULL_HANDLE;
+static uint32_t g_index_count_low = 0, g_index_count_high = 0;
 
-// Pipelines (single 128-byte push-constant layout shared by all)
-static VkPipelineLayout g_pipeline_layout = VK_NULL_HANDLE;
-static VkPipeline g_pipe_bg = VK_NULL_HANDLE;    // fullscreen starfield
-static VkPipeline g_pipe_mesh = VK_NULL_HANDLE;  // lit celestial bodies
-static VkPipeline g_pipe_orbit = VK_NULL_HANDLE; // Kepler trajectory overlays
-static VkPipeline g_pipe_vector = VK_NULL_HANDLE; // velocity vectors
-static VkShaderModule g_vert_module = VK_NULL_HANDLE;
-static VkShaderModule g_frag_module = VK_NULL_HANDLE;
+// v0.5 HDR offscreen chain (extent-coupled with swapchain; recreated together).
+struct OffscreenImage {
+    VkImage img = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+};
+static VkFormat g_hdr_format = VK_FORMAT_UNDEFINED;   // set at init (capability-aware)
+static OffscreenImage g_hdr;      // full-resolution HDR scene target (aka bright source)
+static OffscreenImage g_bright0;  // bloom ping-pong A
+static OffscreenImage g_bright1;  // bloom ping-pong B
+static VkSampler g_post_sampler = VK_NULL_HANDLE;
+
+// v0.5 render passes: scene(HDR+depth), post(single HDR attachment), present(swapchain)
+static VkRenderPass g_pass_scene = VK_NULL_HANDLE;
+static VkRenderPass g_pass_post = VK_NULL_HANDLE;
+static VkRenderPass g_pass_present = VK_NULL_HANDLE;
+static VkFramebuffer g_fb_scene = VK_NULL_HANDLE;
+static VkFramebuffer g_fb_bright0 = VK_NULL_HANDLE, g_fb_bright1 = VK_NULL_HANDLE;
+
+// v0.5 GPU instancing + culling resources (extent-independent)
+static constexpr uint32_t INSTANCE_CAPACITY = 128;
+static VkBuffer g_inst_buf = VK_NULL_HANDLE;         // BodyInstance[INSTANCE_CAPACITY]
+static VkDeviceMemory g_inst_mem = VK_NULL_HANDLE;
+static void* g_inst_mapped = nullptr;                // persistent host-coherent map
+static VkBuffer g_mask_buf = VK_NULL_HANDLE;         // uint32[INSTANCE_CAPACITY] (compute-written)
+static VkDeviceMemory g_mask_mem = VK_NULL_HANDLE;
+static void* g_mask_mapped = nullptr;                // host reads GPU results +1 frame (HUD only)
+
+// v0.5 descriptors (first real descriptor infra in the production app)
+static VkDescriptorPool g_desc_pool = VK_NULL_HANDLE;
+static VkDescriptorSetLayout g_dsl_mesh = VK_NULL_HANDLE;     // 2x SSBO (VERTEX)
+static VkDescriptorSetLayout g_dsl_compute = VK_NULL_HANDLE;  // 2x SSBO (COMPUTE)
+static VkDescriptorSetLayout g_dsl_post1 = VK_NULL_HANDLE;    // 1x sampler (FRAGMENT)
+static VkDescriptorSetLayout g_dsl_post2 = VK_NULL_HANDLE;    // 2x sampler (FRAGMENT)
+static VkDescriptorSet g_ds_mesh = VK_NULL_HANDLE;
+static VkDescriptorSet g_ds_compute = VK_NULL_HANDLE;
+static VkDescriptorSet g_ds_bright = VK_NULL_HANDLE;  // samples HDR
+static VkDescriptorSet g_ds_blur_a = VK_NULL_HANDLE;  // samples bright0 -> writes bright1
+static VkDescriptorSet g_ds_blur_b = VK_NULL_HANDLE;  // samples bright1 -> writes bright0
+static VkDescriptorSet g_ds_composite = VK_NULL_HANDLE; // samples HDR + bright0
+
+// v0.5 pipeline layouts: scene (push-const only), mesh (+SSBO), post1/post2, compute
+static VkPipelineLayout g_layout_scene = VK_NULL_HANDLE;
+static VkPipelineLayout g_layout_mesh = VK_NULL_HANDLE;
+static VkPipelineLayout g_layout_post1 = VK_NULL_HANDLE;
+static VkPipelineLayout g_layout_post2 = VK_NULL_HANDLE;
+static VkPipelineLayout g_layout_compute = VK_NULL_HANDLE;
+
+static VkPipeline g_pipe_bg = VK_NULL_HANDLE;    // fullscreen starfield (scene pass)
+static VkPipeline g_pipe_mesh = VK_NULL_HANDLE;  // instanced lit bodies (scene pass)
+static VkPipeline g_pipe_orbit = VK_NULL_HANDLE; // Kepler trajectory overlays (scene pass)
+static VkPipeline g_pipe_vector = VK_NULL_HANDLE; // velocity vectors / apsis (scene pass)
+static VkPipeline g_pipe_cull = VK_NULL_HANDLE;  // GPU visibility/LOD compute
+static VkPipeline g_pipe_bright = VK_NULL_HANDLE;
+static VkPipeline g_pipe_blur = VK_NULL_HANDLE;
+static VkPipeline g_pipe_composite = VK_NULL_HANDLE;
+
+// v0.5 display parameters (CINEMATIC; never touch science) + perf counters
+// REAL CPU-measured values only; GPU timing: NOT VERIFIED (no GPU here).
+static float g_exposure = 1.0f;                        // [ / ] keys, clamped via policy
+static float g_bloom_strength = 0.6f;                  // clamped [0,1.5]
+struct PerfCounters {
+    double cpu_frame_ms = 0.0;    // real measured host time of render_frame
+    uint64_t draw_calls = 0;      // per frame
+    uint64_t instances = 0;       // instances submitted per instanced draw (N bodies, 2 batches)
+    uint32_t visible_low = 0;     // GPU-mask count (+1 frame lag)
+    uint32_t visible_high = 0;    // GPU-mask count (+1 frame lag)
+    uint32_t post_passes = 4;     // bright, blurH, blurV, composite (static, documented)
+    uint64_t swapchain_recreates = 0;
+    uint64_t alloc_failures = 0;
+};
+static PerfCounters g_perf;
+static double g_cpu_frame_ms = 0.0;
 
 // ASTRA RenderState binding (mirrors bridge contract; truthful per frame)
 static astra::scene::Scene g_scene;
@@ -288,6 +366,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case 'V': g_show_vectors = !g_show_vectors; g_viz_mode = g_show_vectors ? "velocity" : "orbital"; break;
         case 'P': g_show_apsis = !g_show_apsis; break;   // peri/apo tick marks
+        case VK_OEM_4: {                         // [ — exposure down (CINEMATIC display param)
+            g_exposure = astra::app::clamp_exposure(g_exposure / 1.25f);
+            printf("[ASTRA] exposure = x%.3f (CINEMATIC; scientific state unchanged)\n", g_exposure);
+            break;
+        }
+        case VK_OEM_6: {                         // ] — exposure up
+            g_exposure = astra::app::clamp_exposure(g_exposure * 1.25f);
+            printf("[ASTRA] exposure = x%.3f (CINEMATIC; scientific state unchanged)\n", g_exposure);
+            break;
+        }
         case VK_F1: {
             extern void dump_inspector();
             dump_inspector();
@@ -602,81 +690,375 @@ static MeshData make_icosphere(int subdivisions) {
     return {v, idx};
 }
 
-static bool create_geometry() {
-    MeshData mesh = make_icosphere(2);
-    g_index_count = (uint32_t)mesh.indices.size();
+static bool upload_mesh(const MeshData& mesh, VkBuffer& vb, VkDeviceMemory& vb_mem,
+                        VkBuffer& ib, VkDeviceMemory& ib_mem, uint32_t& out_index_count) {
+    out_index_count = (uint32_t)mesh.indices.size();
     const VkDeviceSize vb_size = mesh.verts.size() * sizeof(float);
     const VkDeviceSize ib_size = mesh.indices.size() * sizeof(uint16_t);
-    if (!create_upload_buffer(vb_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, g_vb, g_vb_mem)) return false;
-    if (!create_upload_buffer(ib_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, g_ib, g_ib_mem)) return false;
+    if (!create_upload_buffer(vb_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vb, vb_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(ib_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, ib, ib_mem)) { ++g_perf.alloc_failures; return false; }
     void* p = nullptr;
-    VK_CHECK(vkMapMemory(g_device, g_vb_mem, 0, vb_size, 0, &p));
+    VK_CHECK(vkMapMemory(g_device, vb_mem, 0, vb_size, 0, &p));
     memcpy(p, mesh.verts.data(), (size_t)vb_size);
-    vkUnmapMemory(g_device, g_vb_mem);
+    vkUnmapMemory(g_device, vb_mem);
     p = nullptr;
-    VK_CHECK(vkMapMemory(g_device, g_ib_mem, 0, ib_size, 0, &p));
+    VK_CHECK(vkMapMemory(g_device, ib_mem, 0, ib_size, 0, &p));
     memcpy(p, mesh.indices.data(), (size_t)ib_size);
-    vkUnmapMemory(g_device, g_ib_mem);
-    printf("[ASTRA] Geometry: icosphere %u indices\n", g_index_count);
+    vkUnmapMemory(g_device, ib_mem);
     return true;
 }
 
-// ─── Render pass (color + depth) ──────────────────────────────────────────────
-static bool create_render_pass() {
-    VkAttachmentDescription atts[2]{};
-    atts[0].format = g_sc_format;
-    atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    atts[1].format = g_depth_format;
-    atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
-    atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depth_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription sub{};
-    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &color_ref;
-    sub.pDepthStencilAttachment = &depth_ref;
-
-    VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dep.srcAccessMask = 0;
-    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-    VkRenderPassCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    ci.attachmentCount = 2;
-    ci.pAttachments = atts;
-    ci.subpassCount = 1;
-    ci.pSubpasses = &sub;
-    ci.dependencyCount = 1;
-    ci.pDependencies = &dep;
-    VK_CHECK(vkCreateRenderPass(g_device, &ci, nullptr, &g_render_pass));
+static bool create_geometry() {
+    if (!upload_mesh(make_icosphere(1), g_vb_low, g_vb_mem_low, g_ib_low, g_ib_mem_low, g_index_count_low)) return false;
+    if (!upload_mesh(make_icosphere(2), g_vb_high, g_vb_mem_high, g_ib_high, g_ib_mem_high, g_index_count_high)) return false;
+    printf("[ASTRA] Geometry: LOD LOW icosphere %u idx | LOD HIGH icosphere %u idx\n",
+           g_index_count_low, g_index_count_high);
     return true;
 }
 
+// ─── v0.5: HDR format capability check (no silent 8-bit fallback) ─────────────
+static bool choose_hdr_format() {
+    VkFormatProperties p{};
+    vkGetPhysicalDeviceFormatProperties(g_gpu, VK_FORMAT_R16G16B16A16_SFLOAT, &p);
+    const bool render_ok = (p.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+    const bool sample_ok = (p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+    if (astra::app::choose_hdr_format(render_ok, sample_ok) == astra::app::HdrFormatChoice::R16G16B16A16_SFLOAT) {
+        g_hdr_format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        printf("[ASTRA] HDR color format: R16G16B16A16_SFLOAT (16-bit float, capability-verified)\n");
+        return true;
+    }
+    printf("[ASTRA] HDR color format: NOT AVAILABLE — R16G16B16A16_SFLOAT lacks color-attachment/sampling support on this device; refusing silent LDR fallback\n");
+    return false;
+}
+
+static bool create_offscreen_image(VkExtent2D ext, VkImageUsageFlags usage, OffscreenImage& out) {
+    VkImageCreateInfo ii{};
+    ii.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ii.imageType = VK_IMAGE_TYPE_2D;
+    ii.format = g_hdr_format;
+    ii.extent = {ext.width, ext.height, 1};
+    ii.mipLevels = 1;
+    ii.arrayLayers = 1;
+    ii.samples = VK_SAMPLE_COUNT_1_BIT;
+    ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ii.usage = usage;
+    ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(g_device, &ii, nullptr, &out.img));
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(g_device, out.img, &req);
+    VkMemoryAllocateInfo ai{};
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) { ++g_perf.alloc_failures; return false; }
+    VK_CHECK(vkAllocateMemory(g_device, &ai, nullptr, &out.mem));
+    VK_CHECK(vkBindImageMemory(g_device, out.img, out.mem, 0));
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = out.img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = g_hdr_format;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(g_device, &vi, nullptr, &out.view));
+    return true;
+}
+
+static bool create_offscreen() {
+    if (!create_offscreen_image(g_sc_extent,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_hdr)) return false;
+    if (!create_offscreen_image(g_sc_extent,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_bright0)) return false;
+    if (!create_offscreen_image(g_sc_extent,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_bright1)) return false;
+    printf("[ASTRA] HDR offscreen chain: %ux%u (scene target + bloom ping-pong)\n",
+           g_sc_extent.width, g_sc_extent.height);
+    return true;
+}
+
+static bool create_sampler() {
+    VkSamplerCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    si.magFilter = VK_FILTER_LINEAR;
+    si.minFilter = VK_FILTER_LINEAR;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.maxLod = 0.0f;
+    si.maxAnisotropy = 1.0f;
+    VK_CHECK(vkCreateSampler(g_device, &si, nullptr, &g_post_sampler));
+    return true;
+}
+
+// ─── v0.5: instance SSBO + mask (host-coherent; production-simple) ────────────
+static bool create_gpu_instancing() {
+    const VkDeviceSize inst_bytes = (VkDeviceSize)INSTANCE_CAPACITY * sizeof(astra::app::BodyInstance);
+    const VkDeviceSize mask_bytes = (VkDeviceSize)INSTANCE_CAPACITY * sizeof(uint32_t);
+    if (!create_upload_buffer(inst_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_inst_buf, g_inst_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(mask_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_mask_buf, g_mask_mem)) { ++g_perf.alloc_failures; return false; }
+    VK_CHECK(vkMapMemory(g_device, g_inst_mem, 0, inst_bytes, 0, &g_inst_mapped));
+    VK_CHECK(vkMapMemory(g_device, g_mask_mem, 0, mask_bytes, 0, &g_mask_mapped));
+    memset(g_inst_mapped, 0, (size_t)inst_bytes);
+    memset(g_mask_mapped, 0, (size_t)mask_bytes);
+    printf("[ASTRA] GPU instancing: %u-slot SSBO (%zu B/record) + LOD/visibility mask\n",
+           INSTANCE_CAPACITY, sizeof(astra::app::BodyInstance));
+    return true;
+}
+
+// ─── v0.5: descriptors (pool + layouts + sets) ────────────────────────────────
+static bool create_descriptors() {
+    VkDescriptorPoolSize sizes[2]{};
+    sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    sizes[0].descriptorCount = 8;
+    sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sizes[1].descriptorCount = 12;
+    VkDescriptorPoolCreateInfo pci{};
+    pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    pci.maxSets = 8;
+    pci.poolSizeCount = 2;
+    pci.pPoolSizes = sizes;
+    VK_CHECK(vkCreateDescriptorPool(g_device, &pci, nullptr, &g_desc_pool));
+
+    const auto make_layout = [&](const VkDescriptorSetLayoutBinding* b, uint32_t n, VkDescriptorSetLayout& out) {
+        VkDescriptorSetLayoutCreateInfo li{};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = n;
+        li.pBindings = b;
+        return vkCreateDescriptorSetLayout(g_device, &li, nullptr, &out) == VK_SUCCESS;
+    };
+    VkDescriptorSetLayoutBinding mb[2]{};
+    mb[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    mb[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    if (!make_layout(mb, 2, g_dsl_mesh)) return false;
+    VkDescriptorSetLayoutBinding cb[2]{};
+    cb[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    cb[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    if (!make_layout(cb, 2, g_dsl_compute)) return false;
+    VkDescriptorSetLayoutBinding p1[1]{};
+    p1[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    if (!make_layout(p1, 1, g_dsl_post1)) return false;
+    VkDescriptorSetLayoutBinding p2[2]{};
+    p2[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    p2[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    if (!make_layout(p2, 2, g_dsl_post2)) return false;
+
+    const auto alloc = [&](VkDescriptorSetLayout l, VkDescriptorSet& out) {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = g_desc_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &l;
+        return vkAllocateDescriptorSets(g_device, &ai, &out) == VK_SUCCESS;
+    };
+    if (!alloc(g_dsl_mesh, g_ds_mesh)) return false;
+    if (!alloc(g_dsl_compute, g_ds_compute)) return false;
+    if (!alloc(g_dsl_post1, g_ds_bright)) return false;
+    if (!alloc(g_dsl_post1, g_ds_blur_a)) return false;
+    if (!alloc(g_dsl_post1, g_ds_blur_b)) return false;
+    if (!alloc(g_dsl_post2, g_ds_composite)) return false;
+
+    // Static buffer bindings (SSBOs never change identity).
+    VkDescriptorBufferInfo bi{g_inst_buf, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bm{g_mask_buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[4]{};
+    w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_mesh, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi, nullptr};
+    w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_mesh, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bm, nullptr};
+    w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi, nullptr};
+    w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bm, nullptr};
+    vkUpdateDescriptorSets(g_device, 4, w, 0, nullptr);
+    return true;
+}
+
+// Extent-coupled sampler descriptors; called at init and after every resize.
+static void update_post_descriptors() {
+    VkDescriptorImageInfo hdr{g_post_sampler, g_hdr.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo b0{g_post_sampler, g_bright0.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkDescriptorImageInfo b1{g_post_sampler, g_bright1.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w[5]{};
+    w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_bright, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hdr, nullptr, nullptr};
+    w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_blur_a, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &b0, nullptr, nullptr};
+    w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_blur_b, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &b1, nullptr, nullptr};
+    w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_composite, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &hdr, nullptr, nullptr};
+    w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_composite, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &b0, nullptr, nullptr};
+    vkUpdateDescriptorSets(g_device, 5, w, 0, nullptr);
+}
+
+static void destroy_offscreen() {
+    const auto kill = [&](OffscreenImage& o) {
+        if (o.view) vkDestroyImageView(g_device, o.view, nullptr);
+        if (o.img) vkDestroyImage(g_device, o.img, nullptr);
+        if (o.mem) vkFreeMemory(g_device, o.mem, nullptr);
+        o = {};
+    };
+    if (g_fb_scene) { vkDestroyFramebuffer(g_device, g_fb_scene, nullptr); g_fb_scene = VK_NULL_HANDLE; }
+    if (g_fb_bright0) { vkDestroyFramebuffer(g_device, g_fb_bright0, nullptr); g_fb_bright0 = VK_NULL_HANDLE; }
+    if (g_fb_bright1) { vkDestroyFramebuffer(g_device, g_fb_bright1, nullptr); g_fb_bright1 = VK_NULL_HANDLE; }
+    kill(g_hdr); kill(g_bright0); kill(g_bright1);
+}
+
+// ─── v0.5: three render passes (scene HDR, post HDR, present) ────────────────
+static bool create_render_passes() {
+    // Scene pass: HDR color + depth. Color ends SHADER_READ_ONLY for the post chain.
+    {
+        VkAttachmentDescription atts[2]{};
+        atts[0].format = g_hdr_format;
+        atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        atts[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        atts[1].format = g_depth_format;
+        atts[1].samples = VK_SAMPLE_COUNT_1_BIT;
+        atts[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        atts[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        atts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        atts[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkAttachmentReference dref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &cref;
+        sub.pDepthStencilAttachment = &dref;
+        VkSubpassDependency deps[2]{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        ci.attachmentCount = 2;
+        ci.pAttachments = atts;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        ci.dependencyCount = 2;
+        ci.pDependencies = deps;
+        VK_CHECK(vkCreateRenderPass(g_device, &ci, nullptr, &g_pass_scene));
+    }
+    // Post pass: single HDR attachment (bright/blur ping-pong), ends sampled.
+    {
+        VkAttachmentDescription a{};
+        a.format = g_hdr_format;
+        a.samples = VK_SAMPLE_COUNT_1_BIT;
+        a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // fullscreen overwrite
+        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        a.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &cref;
+        VkSubpassDependency deps[2]{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        ci.attachmentCount = 1;
+        ci.pAttachments = &a;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        ci.dependencyCount = 2;
+        ci.pDependencies = deps;
+        VK_CHECK(vkCreateRenderPass(g_device, &ci, nullptr, &g_pass_post));
+    }
+    // Present pass: composites to the swapchain (SRGB hardware conversion).
+    {
+        VkAttachmentDescription a{};
+        a.format = g_sc_format;
+        a.samples = VK_SAMPLE_COUNT_1_BIT;
+        a.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // fullscreen overwrite
+        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        a.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &cref;
+        VkSubpassDependency dep{};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.srcAccessMask = 0;
+        dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        VkRenderPassCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        ci.attachmentCount = 1;
+        ci.pAttachments = &a;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        ci.dependencyCount = 1;
+        ci.pDependencies = &dep;
+        VK_CHECK(vkCreateRenderPass(g_device, &ci, nullptr, &g_pass_present));
+    }
+    return true;
+}
+
+// Extent-coupled framebuffers: scene (HDR+depth), post (bright0/1), present (per swap image).
 static bool create_framebuffers() {
-    g_framebuffers.resize(g_sc_views.size());
-    for (size_t i = 0; i < g_sc_views.size(); i++) {
-        VkImageView atts[2] = {g_sc_views[i], g_depth_view};
+    {
+        VkImageView atts[2] = {g_hdr.view, g_depth_view};
         VkFramebufferCreateInfo ci{};
         ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        ci.renderPass = g_render_pass;
+        ci.renderPass = g_pass_scene;
         ci.attachmentCount = 2;
+        ci.pAttachments = atts;
+        ci.width = g_sc_extent.width;
+        ci.height = g_sc_extent.height;
+        ci.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(g_device, &ci, nullptr, &g_fb_scene));
+    }
+    const auto post_fb = [&](VkImageView v, VkFramebuffer& out) {
+        VkFramebufferCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        ci.renderPass = g_pass_post;
+        ci.attachmentCount = 1;
+        ci.pAttachments = &v;
+        ci.width = g_sc_extent.width;
+        ci.height = g_sc_extent.height;
+        ci.layers = 1;
+        return vkCreateFramebuffer(g_device, &ci, nullptr, &out) == VK_SUCCESS;
+    };
+    if (!post_fb(g_bright0.view, g_fb_bright0)) return false;
+    if (!post_fb(g_bright1.view, g_fb_bright1)) return false;
+
+    g_framebuffers.resize(g_sc_views.size());
+    for (size_t i = 0; i < g_sc_views.size(); i++) {
+        VkImageView atts[1] = {g_sc_views[i]};
+        VkFramebufferCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        ci.renderPass = g_pass_present;
+        ci.attachmentCount = 1;
         ci.pAttachments = atts;
         ci.width = g_sc_extent.width;
         ci.height = g_sc_extent.height;
@@ -711,10 +1093,11 @@ static bool create_sync() {
     return true;
 }
 
-// ─── Pipelines (shared 128-byte push-constant layout) ─────────────────────────
+// ─── Pipelines (layouts per draw class; 128B push-constant range shared) ─────
 static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* fs, size_t fs_words,
                           VkPrimitiveTopology topo, bool depth_test, bool depth_write,
-                          bool with_vertex_input, VkPipeline& out) {
+                          bool with_vertex_input,
+                          VkPipelineLayout layout, VkRenderPass pass, VkPipeline& out) {
     VkShaderModule vm = create_shader_module(std::vector<uint32_t>(vs, vs + vs_words));
     VkShaderModule fm = create_shader_module(std::vector<uint32_t>(fs, fs + fs_words));
     if (!vm || !fm) { printf("[ASTRA] shader module failed\n"); return false; }
@@ -803,8 +1186,8 @@ static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* f
     gp.pDepthStencilState = &ds;
     gp.pColorBlendState = &cb;
     gp.pDynamicState = &dy;
-    gp.layout = g_pipeline_layout;
-    gp.renderPass = g_render_pass;
+    gp.layout = layout;
+    gp.renderPass = pass;
     gp.subpass = 0;
     VkResult res = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &gp, nullptr, &out);
     vkDestroyShaderModule(g_device, vm, nullptr);
@@ -814,18 +1197,28 @@ static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* f
 }
 
 static bool create_pipelines() {
-    // One layout: 128-byte push-constant range used by bg/mesh/orbit draws.
+    // Shared 128-byte push-constant range for every layout (superset policy).
     VkPushConstantRange pcr{};
-    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset = 0;
     pcr.size = 128;
-    VkPipelineLayoutCreateInfo pli{};
-    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pli.pushConstantRangeCount = 1;
-    pli.pPushConstantRanges = &pcr;
-    VK_CHECK(vkCreatePipelineLayout(g_device, &pli, nullptr, &g_pipeline_layout));
+    const auto make_layout = [&](VkDescriptorSetLayout set_layout, bool has_set, VkPipelineLayout& out) {
+        VkPipelineLayoutCreateInfo pli{};
+        pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pcr;
+        pli.setLayoutCount = has_set ? 1u : 0u;
+        pli.pSetLayouts = has_set ? &set_layout : nullptr;
+        return vkCreatePipelineLayout(g_device, &pli, nullptr, &out) == VK_SUCCESS;
+    };
+    if (!make_layout(VK_NULL_HANDLE, false, g_layout_scene)) return false;
+    if (!make_layout(g_dsl_mesh, true, g_layout_mesh)) return false;
+    if (!make_layout(g_dsl_post1, true, g_layout_post1)) return false;
+    if (!make_layout(g_dsl_post2, true, g_layout_post2)) return false;
+    if (!make_layout(g_dsl_compute, true, g_layout_compute)) return false;
 
-    std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f, vector_v;
+    std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f, vector_v,
+                          cull_c, bright_f, blur_f, composite_f;
     if (!load_shader("astra.vert.spv", astra_v)) return false;
     if (!load_shader("astra.frag.spv", astra_f)) return false;
     if (!load_shader("sphere.vert.spv", sphere_v)) return false;
@@ -833,17 +1226,52 @@ static bool create_pipelines() {
     if (!load_shader("orbit.vert.spv", orbit_v)) return false;
     if (!load_shader("orbit.frag.spv", orbit_f)) return false;
     if (!load_shader("vector.vert.spv", vector_v)) return false;
+    if (!load_shader("cull.comp.spv", cull_c)) return false;
+    if (!load_shader("post_bright.frag.spv", bright_f)) return false;
+    if (!load_shader("post_blur.frag.spv", blur_f)) return false;
+    if (!load_shader("post_composite.frag.spv", composite_f)) return false;
 
+    // Scene pipelines (HDR pass).
     if (!make_pipeline(astra_v.data(), astra_v.size(), astra_f.data(), astra_f.size(),
-                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false, g_pipe_bg)) return false;
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
+                       g_layout_scene, g_pass_scene, g_pipe_bg)) return false;
     if (!make_pipeline(sphere_v.data(), sphere_v.size(), sphere_f.data(), sphere_f.size(),
-                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, true, true, g_pipe_mesh)) return false;
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, true, true,
+                       g_layout_mesh, g_pass_scene, g_pipe_mesh)) return false;
     if (!make_pipeline(orbit_v.data(), orbit_v.size(), orbit_f.data(), orbit_f.size(),
-                       VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, false, g_pipe_orbit)) return false;
+                       VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, false,
+                       g_layout_scene, g_pass_scene, g_pipe_orbit)) return false;
     if (!make_pipeline(vector_v.data(), vector_v.size(), orbit_f.data(), orbit_f.size(),
-                       VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, false, g_pipe_vector)) return false;
+                       VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, false,
+                       g_layout_scene, g_pass_scene, g_pipe_vector)) return false;
+    // Post pipelines (fullscreen triangle, no depth).
+    if (!make_pipeline(astra_v.data(), astra_v.size(), bright_f.data(), bright_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
+                       g_layout_post1, g_pass_post, g_pipe_bright)) return false;
+    if (!make_pipeline(astra_v.data(), astra_v.size(), blur_f.data(), blur_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
+                       g_layout_post1, g_pass_post, g_pipe_blur)) return false;
+    if (!make_pipeline(astra_v.data(), astra_v.size(), composite_f.data(), composite_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
+                       g_layout_post2, g_pass_present, g_pipe_composite)) return false;
 
-    printf("[ASTRA] Pipelines created: background + bodies + orbit overlays + velocity vectors\n");
+    // Compute culling pipeline (deterministic per-slot mask writes).
+    {
+        VkShaderModule cm = create_shader_module(cull_c);
+        if (!cm) { printf("[ASTRA] cull.comp module failed\n"); return false; }
+        VkComputePipelineCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = cm;
+        ci.stage.pName = "main";
+        ci.layout = g_layout_compute;
+        VkResult res = vkCreateComputePipelines(g_device, VK_NULL_HANDLE, 1, &ci, nullptr, &g_pipe_cull);
+        vkDestroyShaderModule(g_device, cm, nullptr);
+        if (res != VK_SUCCESS) { printf("[ASTRA] vkCreateComputePipelines failed: %d\n", (int)res); return false; }
+    }
+
+    printf("[ASTRA] Pipelines: bg + instanced bodies(2 LOD batches) + orbit + vectors + GPU cull + HDR post(bright/blur/composite)\n");
     return true;
 }
 
@@ -860,13 +1288,6 @@ static float visual_radius_units(const astra::app::CelestialBody& b) {
 // length is readability scaling only (true km/s shown in the inspector).
 static double VisualVectorScale(double vmag_km_s) {
     return 4.0 + 0.12 * vmag_km_s;
-}
-
-static astra::app::Mat4 model_of(float px, float py, float pz, float s) {
-    astra::app::Mat4 m = astra::app::Mat4::identity();
-    m.m[0] = s; m.m[5] = s; m.m[10] = s;
-    m.m[12] = px; m.m[13] = py; m.m[14] = pz;
-    return m;
 }
 
 static void sim_tick(double real_dt_s) {
@@ -994,8 +1415,13 @@ static void update_inspector_title(double fps) {
     frame_ms = (fps > 1e-6) ? 1000.0 / fps : 0.0;
     const auto snap = make_hud_snapshot(fps, frame_ms);
     const std::string line = astra::app::hud_summary_line(snap);
-    // v0.4 title: single-line scientific HUD (full matrix on F1).
-    SetWindowTextA(g_hwnd, ("ASTRA COSMOS v0.4  " + line).c_str());
+    // v0.5 title: scientific HUD + renderer telemetry (REAL CPU numbers only).
+    char tail[192];
+    snprintf(tail, sizeof(tail),
+             "  | exp=x%.2f bloom=%.2f | LOD hi/lo=%u/%u | draws=%llu cpu=%.1fms",
+             g_exposure, g_bloom_strength, g_perf.visible_high, g_perf.visible_low,
+             (unsigned long long)g_perf.draw_calls, g_cpu_frame_ms);
+    SetWindowTextA(g_hwnd, ("ASTRA COSMOS v0.5  " + line + tail).c_str());
 }
 
 void dump_inspector() {
@@ -1047,6 +1473,18 @@ void dump_inspector() {
                b.classification.c_str());
     }
     printf("[ASTRA] classifications: REAL=established physics/constants · DATA-DERIVED=JPL/NASA approx inputs · SIMULATED=two-body Kepler output · CINEMATIC=visual scaling only\n");
+    // v0.5 renderer telemetry — REAL CPU-measured values; GPU timing NOT VERIFIED
+    // (this environment has no GPU; nothing below is fabricated).
+    printf("\n[ASTRA] ═══ RENDERER TELEMETRY (v0.5) ═══\n");
+    printf("[ASTRA] CPU frame time=%.2f ms (REAL) · GPU frame time=NOT VERIFIED (no timestamps device-side here)\n", g_perf.cpu_frame_ms);
+    printf("[ASTRA] draws/frame=%llu · instanced draws=2 (LOW+HIGH) · instances/draw=%u · visible LOD hi/lo=%u/%u (GPU mask, +1 frame)\n",
+           (unsigned long long)g_perf.draw_calls, (unsigned)std::min(g_bodies.size(), (size_t)INSTANCE_CAPACITY),
+           g_perf.visible_high, g_perf.visible_low);
+    printf("[ASTRA] post chain: HDR(R16G16B16A16F) -> bright(th=1.0) -> blurH/V -> ACES-approx + exp x%.2f -> SRGB swapchain · bloom strength x%.2f\n",
+           g_exposure, g_bloom_strength);
+    printf("[ASTRA] post passes/frame=%u · swapchain recreations=%llu · alloc failures=%llu · culling mode=GPU compute (deterministic per-slot mask)\n",
+           g_perf.post_passes, (unsigned long long)g_perf.swapchain_recreates,
+           (unsigned long long)g_perf.alloc_failures);
 }
 
 // ─── Swapchain recreation ─────────────────────────────────────────────────────
@@ -1061,24 +1499,30 @@ static bool recreate_swapchain() {
     if (g_width == 0 || g_height == 0 || g_minimized) return true;
 
     vkDeviceWaitIdle(g_device);
+    ++g_perf.swapchain_recreates; // REAL counter (resize/minimize/user events)
     for (auto fb : g_framebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
     g_framebuffers.clear();
     for (auto v : g_sc_views) vkDestroyImageView(g_device, v, nullptr);
     g_sc_views.clear();
     destroy_swapchain_depth();
+    destroy_offscreen(); // extent-coupled: HDR scene target + bloom ping-pong
     if (g_swapchain != VK_NULL_HANDLE) { vkDestroySwapchainKHR(g_device, g_swapchain, nullptr); g_swapchain = VK_NULL_HANDLE; }
 
     if (!create_swapchain()) return false;
     if (!create_depth()) return false;
+    if (!create_offscreen()) return false;
     if (!create_framebuffers()) return false;
-    printf("[ASTRA] Swapchain recreated for %ux%u\n", g_sc_extent.width, g_sc_extent.height);
+    update_post_descriptors();
+    printf("[ASTRA] Swapchain recreated for %ux%u (HDR chain rebuilt)\n",
+           g_sc_extent.width, g_sc_extent.height);
     return true;
 }
 
-// ─── Frame rendering ──────────────────────────────────────────────────────────
+// ─── Frame rendering (v0.5: cull -> HDR scene -> bloom -> composite) ─────────
 static bool render_frame(double fps) {
     if (g_width == 0 || g_height == 0 || g_minimized) { Sleep(16); return true; }
     if (g_swapchain_dirty && !recreate_swapchain()) return false;
+    const auto cpu_t0 = std::chrono::high_resolution_clock::now(); // REAL CPU timing
 
     vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
 
@@ -1099,167 +1543,281 @@ static bool render_frame(double fps) {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cmd_buf, &bi);
 
-    VkClearValue clears[2]{};
-    clears[0].color = {{0.004f, 0.004f, 0.010f, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
-
-    VkRenderPassBeginInfo rp{};
-    rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rp.renderPass = g_render_pass;
-    rp.framebuffer = g_framebuffers[img_idx];
-    rp.renderArea.offset = {0, 0};
-    rp.renderArea.extent = g_sc_extent;
-    rp.clearValueCount = 2;
-    rp.pClearValues = clears;
-    vkCmdBeginRenderPass(g_cmd_buf, &rp, VK_SUBPASS_CONTENTS_INLINE);
-
-    VkViewport viewport{0.0f, 0.0f, (float)g_sc_extent.width, (float)g_sc_extent.height, 0.0f, 1.0f};
-    vkCmdSetViewport(g_cmd_buf, 0, 1, &viewport);
-    VkRect2D scissor{{0, 0}, g_sc_extent};
-    vkCmdSetScissor(g_cmd_buf, 0, 1, &scissor);
-
-    // ── View/projection (camera never sees absolute float coordinates; all
-    // render positions are target-relative, floating origin). ──
+    // ── View/projection (floating origin at the camera target) ──
     const astra::app::Vec3d& target = g_world[(size_t)g_focus];
     const float aspect = (float)g_sc_extent.width / (float)g_sc_extent.height;
     const astra::app::Mat4 proj = g_camera.projection(aspect);
     astra::app::Mat4 view;
+    float eye[3];
     if (g_cam_mode == CamMode::FOLLOW) {
         view = g_camera.view();
+        g_camera.eye_offset(eye);
     } else {
-        // FREE: eye at g_free_pos (target-relative), look direction from orbit angles.
         const double az = g_camera.azimuth, el = g_camera.elevation;
         const float fwd[3] = {(float)(-std::cos(el) * std::cos(az)), (float)(-std::sin(el)), (float)(-std::cos(el) * std::sin(az))};
         view = astra::app::Mat4::look_at(g_free_pos[0], g_free_pos[1], g_free_pos[2],
                                          g_free_pos[0] + fwd[0], g_free_pos[1] + fwd[1], g_free_pos[2] + fwd[2],
                                          0.0f, 1.0f, 0.0f);
+        for (int k = 0; k < 3; ++k) eye[k] = g_free_pos[k];
     }
     const astra::app::Mat4 view_proj = astra::app::Mat4::multiply(proj, view);
 
-    // ── 1. Background pass ──
-    vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_bg);
-    const float bg_pc[8] = {(float)g_clock.sim_time_s, (float)g_sc_extent.width,
-                            (float)g_sc_extent.height, (float)g_frame_count, 0, 0, 0, 0};
-    vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                       0, 16, bg_pc);
-    vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
-
     // Render-space positions (floating origin at the camera target).
-    std::vector<std::array<float,3>> rpos(g_bodies.size());
-    for (size_t i = 0; i < g_bodies.size(); ++i) {
+    const size_t n_bodies = g_bodies.size();
+    std::vector<std::array<float,3>> rpos(n_bodies);
+    for (size_t i = 0; i < n_bodies; ++i) {
         rpos[i] = {(float)((g_world[i][0] - target[0]) * POS_SCALE),
                    (float)((g_world[i][1] - target[1]) * POS_SCALE),
                    (float)((g_world[i][2] - target[2]) * POS_SCALE)};
     }
 
-    // ── 2. Celestial bodies (indexed draws, per-body push constants) ──
-    vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_mesh);
-    VkDeviceSize zero = 0;
-    vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_vb, &zero);
-    vkCmdBindIndexBuffer(g_cmd_buf, g_ib, 0, VK_INDEX_TYPE_UINT16);
-    struct BodyPC { astra::app::Mat4 mvp; float bodyPosRad[4]; float sunPosEmis[4]; float color[4]; };
-    const float sunx = rpos[0][0], suny = rpos[0][1], sunz = rpos[0][2];
-    for (size_t i = 0; i < g_bodies.size(); ++i) {
-        const float r = visual_radius_units(g_bodies[i]);
-        BodyPC pc{};
-        pc.mvp = astra::app::Mat4::multiply(view_proj, model_of(rpos[i][0], rpos[i][1], rpos[i][2], r));
-        pc.bodyPosRad[0] = rpos[i][0]; pc.bodyPosRad[1] = rpos[i][1]; pc.bodyPosRad[2] = rpos[i][2]; pc.bodyPosRad[3] = r;
-        pc.sunPosEmis[0] = sunx; pc.sunPosEmis[1] = suny; pc.sunPosEmis[2] = sunz;
-        pc.sunPosEmis[3] = (g_bodies[i].kind == astra::app::BodyKind::STAR) ? 1.0f : 0.0f;
-        // Selection highlight: selected body brightness +30% (UI only; single
-        // authoritative identity g_selection; no sim effect).
-        const float boost = ((int)i == g_selection) ? 1.3f : 1.0f;
-        pc.color[0] = std::min(1.0f, g_bodies[i].color[0] * boost);
-        pc.color[1] = std::min(1.0f, g_bodies[i].color[1] * boost);
-        pc.color[2] = std::min(1.0f, g_bodies[i].color[2] * boost);
-        pc.color[3] = 1.0f;
-        vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(pc), &pc);
-        vkCmdDrawIndexed(g_cmd_buf, g_index_count, 1, 0, 0, 0);
-    }
+    g_perf.draw_calls = 0;
+    g_perf.instances = 0;
 
-    // ── 3. Orbit overlays (Kepler evaluated in-shader from real elements) ──
-    if (g_bodies.size() > 1) {
-        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_orbit);
-        struct OrbitPC { astra::app::Mat4 viewProj; float e1[4]; float e2[4]; float parent[4]; float color[4]; };
-        for (size_t i = 1; i < g_bodies.size(); ++i) {
-            const auto& b = g_bodies[i];
-            const auto& el = b.elements;
-            OrbitPC pc{};
-            pc.viewProj = view_proj;
-            pc.e1[0] = (float)el.a_km; pc.e1[1] = (float)el.e; pc.e1[2] = (float)el.i; pc.e1[3] = (float)el.raan;
-            const double n = astra::app::mean_motion(el);
-            const double two_pi = 6.283185307179586476925;
-            double M = std::fmod(el.M0 + n * (g_clock.sim_time_s - el.epoch_s), two_pi);
-            if (M < 0.0) M += two_pi;
-            pc.e2[0] = (float)el.argp; pc.e2[1] = (float)M; pc.e2[2] = (float)POS_SCALE; pc.e2[3] = 0.0f;
-            const auto& pw = rpos[(size_t)b.parent >= 0 ? (size_t)b.parent : 0];
-            pc.parent[0] = pw[0]; pc.parent[1] = pw[1]; pc.parent[2] = pw[2]; pc.parent[3] = 0.0f;
-            const bool selected = ((int)i == g_selection);
-            pc.color[0] = g_bodies[i].color[0] * (selected ? 1.0f : 0.45f);
-            pc.color[1] = g_bodies[i].color[1] * (selected ? 1.0f : 0.45f);
-            pc.color[2] = g_bodies[i].color[2] * (selected ? 1.0f : 0.45f);
-            pc.color[3] = 1.0f;
-            vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, sizeof(pc), &pc);
-            vkCmdDraw(g_cmd_buf, 128, 1, 0, 0);
+    // ── 0. Pack GPU instance SSBO from authoritative RenderState (overflow-safe)
+    {
+        auto* inst = (astra::app::BodyInstance*)g_inst_mapped;
+        const size_t n = std::min(n_bodies, (size_t)INSTANCE_CAPACITY);
+        if (n_bodies > INSTANCE_CAPACITY) ++g_perf.alloc_failures; // capacity overflow (counted; capacity currently 10<=128)
+        for (size_t i = 0; i < n; ++i) {
+            inst[i] = astra::app::pack_body_instance(
+                rpos[i][0], rpos[i][1], rpos[i][2], visual_radius_units(g_bodies[i]),
+                g_bodies[i].color[0], g_bodies[i].color[1], g_bodies[i].color[2],
+                (int)i == g_selection);
         }
     }
 
-    // ── 4. Velocity vectors (real vis velocity, CINEMATIC length scale) ──
-    if (g_show_vectors) {
-        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_vector);
-        struct VectorPC { astra::app::Mat4 viewProj; float originScale[4]; float velocity[4]; float color[4]; };
-        for (size_t i = 1; i < g_bodies.size(); ++i) {
-            const double vmag = std::sqrt(g_vel[i][0]*g_vel[i][0] + g_vel[i][1]*g_vel[i][1] + g_vel[i][2]*g_vel[i][2]);
-            if (vmag < 1e-9) continue;
-            VectorPC pc{};
-            pc.viewProj = view_proj;
-            pc.originScale[0] = rpos[i][0]; pc.originScale[1] = rpos[i][1]; pc.originScale[2] = rpos[i][2];
-            pc.originScale[3] = (float)(VisualVectorScale(vmag));
-            pc.velocity[0] = (float)g_vel[i][0]; pc.velocity[1] = (float)g_vel[i][1]; pc.velocity[2] = (float)g_vel[i][2]; pc.velocity[3] = 0.0f;
-            const bool selected_b = ((int)i == g_selection);
-            pc.color[0] = 0.4f; pc.color[1] = selected_b ? 1.0f : 0.8f; pc.color[2] = 0.3f; pc.color[3] = 1.0f;
-            vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, sizeof(pc), &pc);
-            vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+    // ── 0b. HUD counters from the GPU mask (+1 frame readback, REAL GPU output)
+    {
+        const uint32_t* mask = (const uint32_t*)g_mask_mapped;
+        uint32_t lo = 0, hi = 0;
+        for (size_t i = 0; i < n_bodies && i < INSTANCE_CAPACITY; ++i) {
+            if (mask[i] == 1u) ++lo; else if (mask[i] == 2u) ++hi;
         }
+        g_perf.visible_low = lo; g_perf.visible_high = hi;
     }
 
-    // ── 5. Peri/apo tick marks (real apsis positions from elements; P key) ──
-    if (g_show_apsis) {
-        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_vector);
-        struct VectorPC { astra::app::Mat4 viewProj; float originScale[4]; float velocity[4]; float color[4]; };
-        for (size_t i = 1; i < g_bodies.size(); ++i) {
-            const auto& el = g_bodies[i].elements;
-            if (!(el.a_km > 0.0)) continue; // apsis unavailable for the primary
-            const double peri = el.a_km * (1.0 - el.e);
-            const double apo = el.a_km * (1.0 + el.e);
-            // Apsis directions in the orbit plane (nu=0 -> peri, nu=pi -> apo)
-            // through the same PQW->IJK rotation as the scientific engine.
-            const astra::app::Vec3d dir_p = astra::app::rotation_pqw_to_ijk(el.i, el.raan, el.argp, {peri, 0.0, 0.0});
-            const astra::app::Vec3d dir_a = astra::app::rotation_pqw_to_ijk(el.i, el.raan, el.argp, {-apo, 0.0, 0.0});
-            const astra::app::Vec3d& pw = g_world[(size_t)g_bodies[i].parent >= 0 ? (size_t)g_bodies[i].parent : 0];
-            const float mp[2][3] = {
-                {(float)((pw[0] + dir_p[0] - target[0]) * POS_SCALE), (float)((pw[1] + dir_p[1] - target[1]) * POS_SCALE), (float)((pw[2] + dir_p[2] - target[2]) * POS_SCALE)},
-                {(float)((pw[0] + dir_a[0] - target[0]) * POS_SCALE), (float)((pw[1] + dir_a[1] - target[1]) * POS_SCALE), (float)((pw[2] + dir_a[2] - target[2]) * POS_SCALE)}};
-            for (int m = 0; m < 2; ++m) {
-                VectorPC pc{};
+    // ── 1. GPU visibility/LOD classification (deterministic per-slot writes)
+    {
+        const uint32_t n = (uint32_t)std::min(n_bodies, (size_t)INSTANCE_CAPACITY);
+        struct CullPC { float vp[16]; float params[4]; float eye4[4]; } pc{};
+        memcpy(pc.vp, view_proj.m, sizeof(pc.vp));
+        pc.params[0] = (float)n;
+        pc.params[1] = (float)std::tan((g_camera.fov_deg * 3.141592653589793 / 180.0) * 0.5);
+        pc.eye4[0] = eye[0]; pc.eye4[1] = eye[1]; pc.eye4[2] = eye[2];
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipe_cull);
+        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_layout_compute, 0, 1, &g_ds_compute, 0, nullptr);
+        vkCmdPushConstants(g_cmd_buf, g_layout_compute, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(g_cmd_buf, (n + 63) / 64, 1, 1);
+        VkBufferMemoryBarrier bb{};
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = g_mask_buf;
+        bb.offset = 0;
+        bb.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(g_cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+    }
+
+    // ── 2. Scene pass into the HDR target (16-bit float, capability-verified)
+    {
+        VkClearValue clears[2]{};
+        clears[0].color = {{0.004f, 0.004f, 0.010f, 1.0f}}; // HDR linear space
+        clears[1].depthStencil = {1.0f, 0};
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = g_pass_scene;
+        rp.framebuffer = g_fb_scene;
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = g_sc_extent;
+        rp.clearValueCount = 2;
+        rp.pClearValues = clears;
+        vkCmdBeginRenderPass(g_cmd_buf, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport viewport{0.0f, 0.0f, (float)g_sc_extent.width, (float)g_sc_extent.height, 0.0f, 1.0f};
+        vkCmdSetViewport(g_cmd_buf, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, g_sc_extent};
+        vkCmdSetScissor(g_cmd_buf, 0, 1, &scissor);
+
+        // 2a. Procedural sky background (label: PROCEDURAL/CINEMATIC — no star
+        // catalog data available in this repository; documented gap).
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_bg);
+        const float bg_pc[4] = {(float)g_clock.sim_time_s, (float)g_sc_extent.width,
+                                (float)g_sc_extent.height, (float)g_frame_count};
+        vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, 16, bg_pc);
+        vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
+        ++g_perf.draw_calls;
+
+        // 2b. Instanced bodies — TWO draws (LOW then HIGH LOD batch). Selection
+        // highlight indexes the single authoritative identity (g_selection).
+        struct InstPC { float vp[16]; float sunPosEmis[4]; float misc[4]; } ipc{};
+        memcpy(ipc.vp, view_proj.m, sizeof(ipc.vp));
+        ipc.sunPosEmis[0] = rpos[0][0]; ipc.sunPosEmis[1] = rpos[0][1]; ipc.sunPosEmis[2] = rpos[0][2];
+        ipc.sunPosEmis[3] = 1.0f;
+        ipc.misc[0] = (float)g_selection;
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_mesh);
+        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_mesh, 0, 1, &g_ds_mesh, 0, nullptr);
+        VkDeviceSize zero = 0;
+        const uint32_t n_inst = (uint32_t)std::min(n_bodies, (size_t)INSTANCE_CAPACITY);
+        // LOW batch (icosphere subdivision 1)
+        ipc.misc[1] = 1.0f;
+        vkCmdPushConstants(g_cmd_buf, g_layout_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ipc), &ipc);
+        vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_vb_low, &zero);
+        vkCmdBindIndexBuffer(g_cmd_buf, g_ib_low, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(g_cmd_buf, g_index_count_low, n_inst, 0, 0, 0);
+        ++g_perf.draw_calls; g_perf.instances += n_inst;
+        // HIGH batch (icosphere subdivision 2)
+        ipc.misc[1] = 2.0f;
+        vkCmdPushConstants(g_cmd_buf, g_layout_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ipc), &ipc);
+        vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_vb_high, &zero);
+        vkCmdBindIndexBuffer(g_cmd_buf, g_ib_high, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdDrawIndexed(g_cmd_buf, g_index_count_high, n_inst, 0, 0, 0);
+        ++g_perf.draw_calls; g_perf.instances += n_inst;
+
+        // 2c. Orbit overlays (Kepler evaluated in-shader from real elements)
+        if (n_bodies > 1) {
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_orbit);
+            struct OrbitPC { astra::app::Mat4 viewProj; float e1[4]; float e2[4]; float parent[4]; float color[4]; };
+            for (size_t i = 1; i < n_bodies; ++i) {
+                const auto& b = g_bodies[i];
+                const auto& el = b.elements;
+                OrbitPC pc{};
                 pc.viewProj = view_proj;
-                pc.originScale[0] = mp[m][0]; pc.originScale[1] = mp[m][1]; pc.originScale[2] = mp[m][2];
-                pc.originScale[3] = (m == 0 ? 0.55f : 0.40f); // tick lengths
-                // Global +Y tick direction (orientation is presentational; the
-                // apsis POSITION is scientific).
-                pc.velocity[0] = 0.0f; pc.velocity[1] = 1.0f; pc.velocity[2] = 0.0f; pc.velocity[3] = 0.0f;
-                pc.color[0] = (m == 0) ? 1.0f : 0.55f; pc.color[1] = 0.85f; pc.color[2] = (m == 0) ? 0.35f : 1.0f; pc.color[3] = 1.0f;
-                vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                pc.e1[0] = (float)el.a_km; pc.e1[1] = (float)el.e; pc.e1[2] = (float)el.i; pc.e1[3] = (float)el.raan;
+                const double n2 = astra::app::mean_motion(el);
+                const double two_pi = 6.283185307179586476925;
+                double M = std::fmod(el.M0 + n2 * (g_clock.sim_time_s - el.epoch_s), two_pi);
+                if (M < 0.0) M += two_pi;
+                pc.e2[0] = (float)el.argp; pc.e2[1] = (float)M; pc.e2[2] = (float)POS_SCALE; pc.e2[3] = 0.0f;
+                const auto& pw = rpos[(size_t)b.parent >= 0 ? (size_t)b.parent : 0];
+                pc.parent[0] = pw[0]; pc.parent[1] = pw[1]; pc.parent[2] = pw[2]; pc.parent[3] = 0.0f;
+                const bool selected = ((int)i == g_selection);
+                pc.color[0] = g_bodies[i].color[0] * (selected ? 1.0f : 0.45f);
+                pc.color[1] = g_bodies[i].color[1] * (selected ? 1.0f : 0.45f);
+                pc.color[2] = g_bodies[i].color[2] * (selected ? 1.0f : 0.45f);
+                pc.color[3] = 1.0f;
+                vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                    0, sizeof(pc), &pc);
-                vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+                vkCmdDraw(g_cmd_buf, 128, 1, 0, 0);
+                ++g_perf.draw_calls;
             }
         }
+
+        // 2d. Velocity vectors (real sim velocity, CINEMATIC length scale)
+        struct VectorPC { astra::app::Mat4 viewProj; float originScale[4]; float velocity[4]; float color[4]; };
+        if (g_show_vectors) {
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_vector);
+            for (size_t i = 1; i < n_bodies; ++i) {
+                const double vmag = std::sqrt(g_vel[i][0]*g_vel[i][0] + g_vel[i][1]*g_vel[i][1] + g_vel[i][2]*g_vel[i][2]);
+                if (vmag < 1e-9) continue;
+                VectorPC pc{};
+                pc.viewProj = view_proj;
+                pc.originScale[0] = rpos[i][0]; pc.originScale[1] = rpos[i][1]; pc.originScale[2] = rpos[i][2];
+                pc.originScale[3] = (float)(VisualVectorScale(vmag));
+                pc.velocity[0] = (float)g_vel[i][0]; pc.velocity[1] = (float)g_vel[i][1]; pc.velocity[2] = (float)g_vel[i][2]; pc.velocity[3] = 0.0f;
+                const bool sb = ((int)i == g_selection);
+                pc.color[0] = 0.4f; pc.color[1] = sb ? 1.0f : 0.8f; pc.color[2] = 0.3f; pc.color[3] = 1.0f;
+                vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(pc), &pc);
+                vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+                ++g_perf.draw_calls;
+            }
+        }
+
+        // 2e. Peri/apo tick marks (real apsis positions; P key; guarded when unavailable)
+        if (g_show_apsis) {
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_vector);
+            for (size_t i = 1; i < n_bodies; ++i) {
+                const auto& el = g_bodies[i].elements;
+                if (!(el.a_km > 0.0)) continue; // apsis NOT AVAILABLE for the primary
+                const double peri = el.a_km * (1.0 - el.e);
+                const double apo = el.a_km * (1.0 + el.e);
+                const astra::app::Vec3d dir_p = astra::app::rotation_pqw_to_ijk(el.i, el.raan, el.argp, {peri, 0.0, 0.0});
+                const astra::app::Vec3d dir_a = astra::app::rotation_pqw_to_ijk(el.i, el.raan, el.argp, {-apo, 0.0, 0.0});
+                const astra::app::Vec3d& pw = g_world[(size_t)g_bodies[i].parent >= 0 ? (size_t)g_bodies[i].parent : 0];
+                const float mp[2][3] = {
+                    {(float)((pw[0] + dir_p[0] - target[0]) * POS_SCALE), (float)((pw[1] + dir_p[1] - target[1]) * POS_SCALE), (float)((pw[2] + dir_p[2] - target[2]) * POS_SCALE)},
+                    {(float)((pw[0] + dir_a[0] - target[0]) * POS_SCALE), (float)((pw[1] + dir_a[1] - target[1]) * POS_SCALE), (float)((pw[2] + dir_a[2] - target[2]) * POS_SCALE)}};
+                for (int m = 0; m < 2; ++m) {
+                    VectorPC pc{};
+                    pc.viewProj = view_proj;
+                    pc.originScale[0] = mp[m][0]; pc.originScale[1] = mp[m][1]; pc.originScale[2] = mp[m][2];
+                    pc.originScale[3] = (m == 0 ? 0.55f : 0.40f);
+                    pc.velocity[0] = 0.0f; pc.velocity[1] = 1.0f; pc.velocity[2] = 0.0f; pc.velocity[3] = 0.0f;
+                    pc.color[0] = (m == 0) ? 1.0f : 0.55f; pc.color[1] = 0.85f; pc.color[2] = (m == 0) ? 0.35f : 1.0f; pc.color[3] = 1.0f;
+                    vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                       0, sizeof(pc), &pc);
+                    vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+                    ++g_perf.draw_calls;
+                }
+            }
+        }
+        vkCmdEndRenderPass(g_cmd_buf);
     }
 
-    vkCmdEndRenderPass(g_cmd_buf);
+    // ── 3. Bright pass: HDR -> bright0 ──
+    const auto fullscreen_post = [&](VkPipeline pipe, VkPipelineLayout layout,
+                                     VkDescriptorSet ds, VkFramebuffer fb, const float pc_data[4]) {
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = g_pass_post;
+        rp.framebuffer = fb;
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = g_sc_extent;
+        rp.clearValueCount = 0;
+        rp.pClearValues = nullptr;
+        vkCmdBeginRenderPass(g_cmd_buf, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport viewport{0.0f, 0.0f, (float)g_sc_extent.width, (float)g_sc_extent.height, 0.0f, 1.0f};
+        vkCmdSetViewport(g_cmd_buf, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, g_sc_extent};
+        vkCmdSetScissor(g_cmd_buf, 0, 1, &scissor);
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(g_cmd_buf, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc_data);
+        vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
+        vkCmdEndRenderPass(g_cmd_buf);
+        ++g_perf.draw_calls;
+    };
+    {
+        const float bright_pc[4] = {astra::app::bloom_threshold(), 0.5f, 0, 0};
+        fullscreen_post(g_pipe_bright, g_layout_post1, g_ds_bright, g_fb_bright0, bright_pc);
+    }
+    // ── 4. Blur H: bright0 -> bright1 ──
+    {
+        const float dir[4] = {1.0f / (float)g_sc_extent.width, 0.0f, 0, 0};
+        fullscreen_post(g_pipe_blur, g_layout_post1, g_ds_blur_a, g_fb_bright1, dir);
+    }
+    // ── 5. Blur V: bright1 -> bright0 ──
+    {
+        const float dir[4] = {0.0f, 1.0f / (float)g_sc_extent.height, 0, 0};
+        fullscreen_post(g_pipe_blur, g_layout_post1, g_ds_blur_b, g_fb_bright0, dir);
+    }
+    // ── 6. Composite: HDR + bloom -> swapchain (ACES-approx + exposure) ──
+    {
+        VkRenderPassBeginInfo rp{};
+        rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rp.renderPass = g_pass_present;
+        rp.framebuffer = g_framebuffers[img_idx];
+        rp.renderArea.offset = {0, 0};
+        rp.renderArea.extent = g_sc_extent;
+        rp.clearValueCount = 0;
+        vkCmdBeginRenderPass(g_cmd_buf, &rp, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport viewport{0.0f, 0.0f, (float)g_sc_extent.width, (float)g_sc_extent.height, 0.0f, 1.0f};
+        vkCmdSetViewport(g_cmd_buf, 0, 1, &viewport);
+        VkRect2D scissor{{0, 0}, g_sc_extent};
+        vkCmdSetScissor(g_cmd_buf, 0, 1, &scissor);
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_composite);
+        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_post2, 0, 1, &g_ds_composite, 0, nullptr);
+        const float cpc[4] = {g_exposure, g_bloom_strength, 0, 0};
+        vkCmdPushConstants(g_cmd_buf, g_layout_post2, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, cpc);
+        vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
+        vkCmdEndRenderPass(g_cmd_buf);
+        ++g_perf.draw_calls;
+    }
+
     vkEndCommandBuffer(g_cmd_buf);
 
     VkPipelineStageFlags wait_stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1288,6 +1846,10 @@ static bool render_frame(double fps) {
         printf("[ASTRA] vkQueuePresentKHR failed: %d\n", (int)presented);
         return false;
     }
+
+    g_cpu_frame_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - cpu_t0).count();
+    g_perf.cpu_frame_ms = g_cpu_frame_ms;
     (void)fps;
     return true;
 }
@@ -1299,20 +1861,45 @@ static void cleanup() {
     if (g_pipe_mesh) vkDestroyPipeline(g_device, g_pipe_mesh, nullptr);
     if (g_pipe_orbit) vkDestroyPipeline(g_device, g_pipe_orbit, nullptr);
     if (g_pipe_vector) vkDestroyPipeline(g_device, g_pipe_vector, nullptr);
-    if (g_pipeline_layout) vkDestroyPipelineLayout(g_device, g_pipeline_layout, nullptr);
-    if (g_vert_module) vkDestroyShaderModule(g_device, g_vert_module, nullptr);
-    if (g_frag_module) vkDestroyShaderModule(g_device, g_frag_module, nullptr);
-    if (g_vb) vkDestroyBuffer(g_device, g_vb, nullptr);
-    if (g_vb_mem) vkFreeMemory(g_device, g_vb_mem, nullptr);
-    if (g_ib) vkDestroyBuffer(g_device, g_ib, nullptr);
-    if (g_ib_mem) vkFreeMemory(g_device, g_ib_mem, nullptr);
+    if (g_pipe_cull) vkDestroyPipeline(g_device, g_pipe_cull, nullptr);
+    if (g_pipe_bright) vkDestroyPipeline(g_device, g_pipe_bright, nullptr);
+    if (g_pipe_blur) vkDestroyPipeline(g_device, g_pipe_blur, nullptr);
+    if (g_pipe_composite) vkDestroyPipeline(g_device, g_pipe_composite, nullptr);
+    if (g_layout_scene) vkDestroyPipelineLayout(g_device, g_layout_scene, nullptr);
+    if (g_layout_mesh) vkDestroyPipelineLayout(g_device, g_layout_mesh, nullptr);
+    if (g_layout_post1) vkDestroyPipelineLayout(g_device, g_layout_post1, nullptr);
+    if (g_layout_post2) vkDestroyPipelineLayout(g_device, g_layout_post2, nullptr);
+    if (g_layout_compute) vkDestroyPipelineLayout(g_device, g_layout_compute, nullptr);
+    if (g_inst_mapped) vkUnmapMemory(g_device, g_inst_mem);
+    if (g_mask_mapped) vkUnmapMemory(g_device, g_mask_mem);
+    if (g_inst_buf) vkDestroyBuffer(g_device, g_inst_buf, nullptr);
+    if (g_mask_buf) vkDestroyBuffer(g_device, g_mask_buf, nullptr);
+    if (g_inst_mem) vkFreeMemory(g_device, g_inst_mem, nullptr);
+    if (g_mask_mem) vkFreeMemory(g_device, g_mask_mem, nullptr);
+    if (g_vb_low) vkDestroyBuffer(g_device, g_vb_low, nullptr);
+    if (g_vb_high) vkDestroyBuffer(g_device, g_vb_high, nullptr);
+    if (g_ib_low) vkDestroyBuffer(g_device, g_ib_low, nullptr);
+    if (g_ib_high) vkDestroyBuffer(g_device, g_ib_high, nullptr);
+    if (g_vb_mem_low) vkFreeMemory(g_device, g_vb_mem_low, nullptr);
+    if (g_vb_mem_high) vkFreeMemory(g_device, g_vb_mem_high, nullptr);
+    if (g_ib_mem_low) vkFreeMemory(g_device, g_ib_mem_low, nullptr);
+    if (g_ib_mem_high) vkFreeMemory(g_device, g_ib_mem_high, nullptr);
+    if (g_post_sampler) vkDestroySampler(g_device, g_post_sampler, nullptr);
+    if (g_desc_pool) vkDestroyDescriptorPool(g_device, g_desc_pool, nullptr);
+    if (g_dsl_mesh) vkDestroyDescriptorSetLayout(g_device, g_dsl_mesh, nullptr);
+    if (g_dsl_compute) vkDestroyDescriptorSetLayout(g_device, g_dsl_compute, nullptr);
+    if (g_dsl_post1) vkDestroyDescriptorSetLayout(g_device, g_dsl_post1, nullptr);
+    if (g_dsl_post2) vkDestroyDescriptorSetLayout(g_device, g_dsl_post2, nullptr);
     destroy_swapchain_depth();
+    destroy_offscreen();
     if (g_img_sem) vkDestroySemaphore(g_device, g_img_sem, nullptr);
     if (g_render_sem) vkDestroySemaphore(g_device, g_render_sem, nullptr);
     if (g_fence) vkDestroyFence(g_device, g_fence, nullptr);
     if (g_cmd_pool) vkDestroyCommandPool(g_device, g_cmd_pool, nullptr);
     for (auto fb : g_framebuffers) vkDestroyFramebuffer(g_device, fb, nullptr);
-    if (g_render_pass) vkDestroyRenderPass(g_device, g_render_pass, nullptr);
+    if (g_pass_scene) vkDestroyRenderPass(g_device, g_pass_scene, nullptr);
+    if (g_pass_post) vkDestroyRenderPass(g_device, g_pass_post, nullptr);
+    if (g_pass_present) vkDestroyRenderPass(g_device, g_pass_present, nullptr);
     for (auto v : g_sc_views) vkDestroyImageView(g_device, v, nullptr);
     if (g_swapchain) vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
     if (g_device) vkDestroyDevice(g_device, nullptr);
@@ -1326,7 +1913,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
-    printf("[ASTRA] ASTRA COSMOS v0.4 — HUD model, audio bus, persistence, LUT, apsis markers, selection/deselect\n");
+    printf("[ASTRA] ASTRA COSMOS v0.5 — REAL RENDERING: HDR16F pipeline, bloom, instanced LOD bodies, GPU culling, ACES-approx composite\n");
 
     // Scientific scenario (Python engine remains the authority; this native
     // mirror reproduces astra.orbital exactly — see app/celestial_sim.h).
@@ -1361,16 +1948,22 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!create_instance())   { printf("[ASTRA] Instance failed\n"); cleanup(); return 1; }
     if (!create_surface())    { printf("[ASTRA] Surface failed\n"); cleanup(); return 1; }
     if (!create_device())     { printf("[ASTRA] Device failed\n"); cleanup(); return 1; }
+    if (!choose_hdr_format()) { printf("[ASTRA] HDR format unavailable\n"); cleanup(); return 1; }
     if (!create_swapchain())  { printf("[ASTRA] Swapchain failed\n"); cleanup(); return 1; }
     if (!create_depth())      { printf("[ASTRA] Depth failed\n"); cleanup(); return 1; }
-    if (!create_render_pass()){ printf("[ASTRA] Render pass failed\n"); cleanup(); return 1; }
+    if (!create_offscreen())  { printf("[ASTRA] HDR offscreen failed\n"); cleanup(); return 1; }
+    if (!create_render_passes()){ printf("[ASTRA] Render passes failed\n"); cleanup(); return 1; }
     if (!create_framebuffers()){ printf("[ASTRA] Framebuffers failed\n"); cleanup(); return 1; }
     if (!create_commands())   { printf("[ASTRA] Commands failed\n"); cleanup(); return 1; }
     if (!create_sync())       { printf("[ASTRA] Sync failed\n"); cleanup(); return 1; }
     if (!create_geometry())   { printf("[ASTRA] Geometry failed\n"); cleanup(); return 1; }
+    if (!create_sampler())    { printf("[ASTRA] Sampler failed\n"); cleanup(); return 1; }
+    if (!create_gpu_instancing()){ printf("[ASTRA] Instancing buffers failed\n"); cleanup(); return 1; }
+    if (!create_descriptors()) { printf("[ASTRA] Descriptors failed\n"); cleanup(); return 1; }
+    update_post_descriptors();
     if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    printf("[ASTRA] v0.4 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | F1 HUD+inspector | ESC quit\n");
+    printf("[ASTRA] v0.5 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | [ ] exposure | F1 HUD+inspector | ESC quit\n");
     dump_inspector();
 
     auto t_prev = std::chrono::high_resolution_clock::now();

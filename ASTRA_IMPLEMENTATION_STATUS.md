@@ -1,4 +1,28 @@
-# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.4)
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.5)
+
+## 0. v0.5 REAL RENDERING increment (Step 2 continuation)
+
+Full report: `ASTRA_V0_5_REPORT.md`. Vocabulary is exact; this environment has
+NO GPU and NO Windows, so every item is at most SOURCE-VERIFIED (headers +
+gates) unless explicitly promoted.
+
+| Brief item | Status | Evidence |
+|------------|--------|----------|
+| HDR 16F offscreen (capability-aware, explicit failure) | IMPLEMENTED, SOURCE-VERIFIED; RUNTIME NOT VERIFIED | `choose_hdr_format` + `create_offscreen`; policy gates |
+| Exposure + ACES-approx tone map (consumable via `[`/`]`) | IMPLEMENTED, SOURCE-VERIFIED; RUNTIME NOT VERIFIED | `post_composite.frag`; clamp gates |
+| Real minimal bloom (bright→blurH→blurV→composite) | IMPLEMENTED, SOURCE-VERIFIED; RUNTIME NOT VERIFIED | 3+1 real passes/FBs/descriptors |
+| Real instancing (32B SSBO, 2 batched draws) | IMPLEMENTED, SOURCE-VERIFIED; RUNTIME NOT VERIFIED | `BodyInstance`/pack gates; 2×`vkCmdDrawIndexed` |
+| GPU culling (deterministic per-slot mask, compute) | IMPLEMENTED, SOURCE-VERIFIED + CPU twin gates (2984); RUNTIME NOT VERIFIED | `cull.comp` + barrier; documented boundary: no indirect (deferred) |
+| Real LOD (subdiv1 vs 2, screen-fraction rule) | IMPLEMENTED, SOURCE-VERIFIED + gates; RUNTIME NOT VERIFIED | 240/960-idx meshes; policy fix §3.1 in report |
+| Starfield classification | DOCUMENTED GAP (procedural-only, no catalog; not faked) | shader label |
+| Orbit/velocity/apsis overlays | VERIFIED (source + kepler 99/99) | unchanged scientific path |
+| Perf instrumentation | IMPLEMENTED (CPU real; GPU NOT VERIFIED, printed as such) | F1 telemetry section |
+| On-canvas HUD | PLANNED v0.6 (stabilization order) | — |
+
+Counts: v04 562/562 · v05 2984/2984 · kepler 99/99 (3.55e-13) · pytest 1535/1535 · production shaders 11/11 · native build [12/12] · main_production syntax 0 errors vs Vulkan 1.4.362.
+
+---
+
 
 ## 0. v0.4 increment (Step 2 continuation)
 
