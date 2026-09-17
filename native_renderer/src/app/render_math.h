@@ -92,4 +92,12 @@ void make_axes_segments(float origin[3], float L, Seg3 out3[3]);
 // in body-local orientation; length = visual_radius * 1.6).
 void make_selection_marker(float center[3], float half_span, Seg3 out2[2]);
 
+// v0.7: GPU timestamp policy. A device only yields genuine GPU frame time when
+// the graphics queue family reports timestampValidBits > 0 AND the device
+// exposes a valid timestampPeriod (ns per tick). Otherwise the app must print
+// "GPU TIMING: NOT AVAILABLE" — never substitute CPU timing.
+bool gpu_timing_supported(uint32_t timestamp_valid_bits, float timestamp_period_ns);
+// Convert a tick delta to milliseconds (callers guard with gpu_timing_supported).
+double gpu_ms_from_ticks(uint64_t tick_delta, float timestamp_period_ns);
+
 } // namespace astra::app

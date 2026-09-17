@@ -215,6 +215,29 @@ int main() {
         ++total;
     }
 
+    // ---- v0.7: GPU timestamp policy ----
+    gate("gpu timestamp policy (Phase 10 semantics)");
+    {
+        CHECK(!gpu_timing_supported(0u, 1.0f), "no timestamp bits -> NOT AVAILABLE");
+        CHECK(!gpu_timing_supported(64u, 0.0f), "zero period -> NOT AVAILABLE");
+        CHECK(gpu_timing_supported(32u, 1.0f), "valid bits + period -> supported");
+        CHECK(gpu_timing_supported(1u, 0.5f), "half-ns period supported");
+        const double ms = gpu_ms_from_ticks(1000000, 1.0f); // 1e6 ticks * 1ns = 1ms
+        CHECK(std::fabs(ms - 1.0) < 1e-9, "tick->ms conversion exact");
+        CHECK(std::fabs(gpu_ms_from_ticks(0, 1.0f)) < 1e-12, "zero delta -> 0 ms");
+        // Large-delta stress: 1e12 ticks at 0.5ns = 5e11 ns = 500000 ms.
+        CHECK(std::fabs(gpu_ms_from_ticks(1000000000000ULL, 0.5f) - 500000.0) < 1e-3, "large delta scale");
+        // Sweep monotonic in delta.
+        double prev = -1.0;
+        for (uint64_t d = 0; d < 100000; d = d * 3 + 1) {
+            double m = gpu_ms_from_ticks(d, 0.83f);
+            CHECK(m >= prev, "monotone");
+            prev = m;
+            ++total;
+        }
+        total += 8;
+    }
+
     if (g_fail != 0) {
         std::printf("v06_gates: FAILED (%d checks failed, %d executed)\n", g_fail, total);
         return 1;

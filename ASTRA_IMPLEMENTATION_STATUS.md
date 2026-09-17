@@ -1,4 +1,24 @@
-# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.6)
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.7)
+
+## 0. v0.7 WINDOWS/GPU validation phase (environment audit + Phase 10 source work)
+
+Full reports: `ASTRA_V0_7_BASELINE_REPORT.md`, `ASTRA_V0_7_WINDOWS_GPU_VALIDATION_REPORT.md`.
+**Outcome: BLOCKED — ENVIRONMENT LIMITATION** (Linux sandbox, zero Vulkan ICDs incl. no software
+device, no Windows, GitHub-only network). Nothing runtime/GPU/Windows is claimed.
+
+| Area | Status |
+|------|--------|
+| Environment incident (HEAD coercion + /tmp wipe) | RECOVERED with zero data loss (remote-verified) |
+| Toolchain restoration (headers, glslang 16.6.0, loader 1.4.362, venv) | RESTORED; batteries re-pass after re-provision |
+| Phase 10 GPU timestamps (feature-gated `VkQueryPool`, NOT AVAILABLE semantics) | IMPLEMENTED, SOURCE-VERIFIED + gates (663 v06 checks); RUNTIME NOT VERIFIED |
+| Windows build + launch, real device evidence, RenderDoc, visual verification, FPS numbers | **BLOCKED — ENVIRONMENT** (checklist W1–W15 in validation report) |
+| Real star catalog | **BLOCKED — DATA** (no network/legal dataset; nothing fabricated) |
+
+Post-incident counts (all re-run): v04 562/562 · v05 2984/2984 · v06 663/663 · kepler 99/99 (3.55e-13) ·
+pytest 1535/1535 · native build PASS · shaders 13/13 + validator 19/0 · main syntax 0 errors vs Vulkan 1.4.362.
+
+---
+
 
 ## 0. v0.6 STABILIZATION increment (Step 2 continuation)
 

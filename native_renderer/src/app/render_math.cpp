@@ -107,4 +107,12 @@ void make_selection_marker(float center[3], float half_span, Seg3 out2[2]) {
     out2[1] = {center[0], center[1] - half_span, center[2], center[0], center[1] + half_span, center[2]};
 }
 
+bool gpu_timing_supported(uint32_t timestamp_valid_bits, float timestamp_period_ns) {
+    return timestamp_valid_bits > 0u && timestamp_period_ns > 0.0f;
+}
+
+double gpu_ms_from_ticks(uint64_t tick_delta, float timestamp_period_ns) {
+    return (double)tick_delta * (double)timestamp_period_ns / 1.0e6;
+}
+
 } // namespace astra::app

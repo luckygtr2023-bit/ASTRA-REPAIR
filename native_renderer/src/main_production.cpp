@@ -205,6 +205,16 @@ static VkPipeline g_pipe_composite = VK_NULL_HANDLE;
 // REAL CPU-measured values only; GPU timing: NOT VERIFIED (no GPU here).
 static float g_exposure = 1.0f;                        // [ / ] keys, clamped via policy
 static float g_bloom_strength = 0.6f;                  // clamped [0,1.5]
+
+// v0.7/Phase 10: feature-gated GPU timestamp instrumentation. Values appear
+// ONLY when the device truly supports timestamps (queue timestampValidBits>0
+// and timestampPeriod>0). Otherwise HUD reports "GPU TIMING: NOT AVAILABLE" —
+// CPU timing is never substituted for GPU timing.
+static bool g_gpu_ts_supported = false;
+static float g_gpu_ts_period_ns = 0.0f;
+static uint32_t g_gpu_ts_valid_bits = 0;
+static VkQueryPool g_gpu_ts_pool = VK_NULL_HANDLE;  // 2 timestamps: frame-begin, frame-end
+static double g_gpu_frame_ms = 0.0;                 // REAL device value (+1 frame)
 struct PerfCounters {
     double cpu_frame_ms = 0.0;    // real measured host time of render_frame
     uint64_t draw_calls = 0;      // per frame (incl. indirect draws)
@@ -547,6 +557,13 @@ static bool create_device() {
                p.limits.maxBoundDescriptorSets, p.limits.maxPushConstantsSize,
                p.limits.maxComputeWorkGroupCount[0], p.limits.maxComputeWorkGroupCount[1], p.limits.maxComputeWorkGroupCount[2],
                p.limits.maxPerStageDescriptorStorageBuffers, p.limits.maxPerStageDescriptorStorageBuffers, 0u);
+        // Phase 10: timestamp capability (queue family + device period).
+        g_gpu_ts_valid_bits = qfs[g_gfx_family].timestampValidBits;
+        g_gpu_ts_period_ns = p.limits.timestampPeriod;
+        g_gpu_ts_supported = astra::app::gpu_timing_supported(g_gpu_ts_valid_bits, g_gpu_ts_period_ns);
+        printf("[ASTRA] DIAG GPU timestamp: queue-valid-bits=%u period=%.3f ns/tick -> %s\n",
+               g_gpu_ts_valid_bits, g_gpu_ts_period_ns,
+               g_gpu_ts_supported ? "SUPPORTED (VkQueryPool timestamps will be used)" : "NOT AVAILABLE");
         printf("[ASTRA] DIAG validation layers: none requested (release build; debug layers optional, not fabricated as enabled)\n");
     }
     return true;
@@ -954,6 +971,21 @@ static bool create_descriptors() {
     w2[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bh, nullptr};
     w2[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bc, nullptr};
     vkUpdateDescriptorSets(g_device, 2, w2, 0, nullptr);
+    return true;
+}
+
+// v0.7/Phase 10: timestamp query pool (feature-gated; only when truly supported).
+static bool create_gpu_timestamps() {
+    if (!g_gpu_ts_supported) {
+        printf("[ASTRA] GPU timestamp pool: skipped (GPU TIMING: NOT AVAILABLE on this device)\n");
+        return true;
+    }
+    VkQueryPoolCreateInfo qi{};
+    qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qi.queryCount = 2;
+    VK_CHECK(vkCreateQueryPool(g_device, &qi, nullptr, &g_gpu_ts_pool));
+    printf("[ASTRA] GPU timestamp pool: created (2 timestamps, feature-verified)\n");
     return true;
 }
 
@@ -1582,7 +1614,13 @@ void dump_inspector() {
     // v0.5 renderer telemetry — REAL CPU-measured values; GPU timing NOT VERIFIED
     // (this environment has no GPU; nothing below is fabricated).
     printf("\n[ASTRA] ═══ RENDERER TELEMETRY (v0.5) ═══\n");
-    printf("[ASTRA] CPU frame time=%.2f ms (REAL) · GPU frame time=NOT VERIFIED (no timestamps device-side here)\n", g_perf.cpu_frame_ms);
+    if (g_gpu_ts_supported) {
+        printf("[ASTRA] CPU frame time=%.2f ms (REAL) · GPU frame time=%.2f ms (REAL, VkQueryPool timestamps)\n",
+               g_perf.cpu_frame_ms, g_gpu_frame_ms);
+    } else {
+        printf("[ASTRA] CPU frame time=%.2f ms (REAL) · GPU TIMING: NOT AVAILABLE (device lacks timestamp support)\n",
+               g_perf.cpu_frame_ms);
+    }
     printf("[ASTRA] draws/frame=%llu (incl. indirect=%llu, dispatches=%llu) · GPU-driven path: cull.comp -> 2x vkCmdDrawIndexedIndirect (no CPU list regen)\n",
            (unsigned long long)g_perf.draw_calls, (unsigned long long)g_perf.indirect_draw_calls,
            (unsigned long long)g_perf.dispatch_calls);
@@ -1634,6 +1672,17 @@ static bool render_frame(double fps) {
 
     vkWaitForFences(g_device, 1, &g_fence, VK_TRUE, UINT64_MAX);
 
+    // Runtime GPU timing: prior submission is complete here (fence signaled),
+    // so its timestamps are readable — 1-frame-lag, REAL device values only.
+    if (g_gpu_ts_pool != VK_NULL_HANDLE) {
+        uint64_t ts[2] = {0, 0};
+        VkResult qr = vkGetQueryPoolResults(g_device, g_gpu_ts_pool, 0, 2,
+                                            sizeof(ts), ts, sizeof(uint64_t),
+                                            VK_QUERY_RESULT_64_BIT);
+        if (qr == VK_SUCCESS && ts[1] >= ts[0])
+            g_gpu_frame_ms = astra::app::gpu_ms_from_ticks(ts[1] - ts[0], g_gpu_ts_period_ns);
+    }
+
     uint32_t img_idx = 0;
     VkResult acquire = vkAcquireNextImageKHR(g_device, g_swapchain, UINT64_MAX, g_img_sem, VK_NULL_HANDLE, &img_idx);
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR) { g_swapchain_dirty = true; return true; }
@@ -1650,6 +1699,10 @@ static bool render_frame(double fps) {
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_cmd_buf, &bi);
+    if (g_gpu_ts_pool != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(g_cmd_buf, g_gpu_ts_pool, 0, 2);
+        vkCmdWriteTimestamp(g_cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_gpu_ts_pool, 0);
+    }
 
     // ── View/projection (floating origin at the camera target) ──
     const astra::app::Vec3d& target = g_world[(size_t)g_focus];
@@ -2022,6 +2075,9 @@ static bool render_frame(double fps) {
         ++g_perf.draw_calls;
     }
 
+    if (g_gpu_ts_pool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(g_cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_gpu_ts_pool, 1);
+    }
     vkEndCommandBuffer(g_cmd_buf);
 
     VkPipelineStageFlags wait_stages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -2100,6 +2156,7 @@ static void cleanup() {
     if (g_ib_mem_high) vkFreeMemory(g_device, g_ib_mem_high, nullptr);
     if (g_post_sampler) vkDestroySampler(g_device, g_post_sampler, nullptr);
     if (g_desc_pool) vkDestroyDescriptorPool(g_device, g_desc_pool, nullptr);
+    if (g_gpu_ts_pool) vkDestroyQueryPool(g_device, g_gpu_ts_pool, nullptr);
     if (g_dsl_mesh) vkDestroyDescriptorSetLayout(g_device, g_dsl_mesh, nullptr);
     if (g_dsl_compute) vkDestroyDescriptorSetLayout(g_device, g_dsl_compute, nullptr);
     if (g_dsl_post1) vkDestroyDescriptorSetLayout(g_device, g_dsl_post1, nullptr);
@@ -2172,6 +2229,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!create_sync())       { printf("[ASTRA] Sync failed\n"); cleanup(); return 1; }
     if (!create_geometry())   { printf("[ASTRA] Geometry failed\n"); cleanup(); return 1; }
     if (!create_sampler())    { printf("[ASTRA] Sampler failed\n"); cleanup(); return 1; }
+    if (!create_gpu_timestamps()){ printf("[ASTRA] Timestamp pool failed\n"); cleanup(); return 1; }
     if (!create_gpu_instancing()){ printf("[ASTRA] Instancing buffers failed\n"); cleanup(); return 1; }
     if (!create_descriptors()) { printf("[ASTRA] Descriptors failed\n"); cleanup(); return 1; }
     update_post_descriptors();
