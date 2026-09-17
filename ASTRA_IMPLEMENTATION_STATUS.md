@@ -1,8 +1,20 @@
-# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.7)
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.7a)
 
-## 0. v0.7 WINDOWS/GPU validation phase (environment audit + Phase 10 source work)
+## 0. v0.7a environment gate outcome
+
+**C. BLOCKED — ENVIRONMENT LIMITATION** (`ASTRA_V0_7A_ENVIRONMENT_REPORT.md`).
+This turn's machine is not the real Windows+GPU target: Linux 6.1.158 Debian 12,
+zero Vulkan ICDs (no lavapipe), no Windows tooling. W1–W15 cannot execute; no
+PASS fabricated, no substitutes used (no mock Vulkan / lavapipe / stale EXE).
+Source/static health re-proven with zero source changes: v04 562/562,
+v06 645/645 (record-corrected count; v0.7 text printed 663 — corrected here),
+kepler 99/99, 13/13 shaders. Re-entry conditions are fixed in the env report;
+promote statuses only on the real machine with RenderDoc/log artifacts.
+
+## 1. v0.7 WINDOWS/GPU validation phase (environment audit + Phase 10 source work)
 
 Full reports: `ASTRA_V0_7_BASELINE_REPORT.md`, `ASTRA_V0_7_WINDOWS_GPU_VALIDATION_REPORT.md`.
+**Outcome: BLOCKED — ENVIRONMENT LIMITATION** (Linux sandbox, zero Vulkan ICDs incl. no software
 **Outcome: BLOCKED — ENVIRONMENT LIMITATION** (Linux sandbox, zero Vulkan ICDs incl. no software
 device, no Windows, GitHub-only network). Nothing runtime/GPU/Windows is claimed.
 
