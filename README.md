@@ -201,11 +201,18 @@ and rendered each frame with real Vulkan: depth-tested lit bodies (icosphere,
 lambert + emissive star), Kepler orbit overlays evaluated in-shader from real
 elements, procedural starfield background, floating-origin camera.
 
-- **Controls (v0.3)**: arrows = look/orbit · Tab / Shift+Tab = select body · `O` = orbit-follow ↔ FREE camera ·
+- **Controls (v0.4)**: arrows = look/orbit · Tab / Shift+Tab = select+focus body · `X` = deselect · `O` = orbit-follow ↔ FREE camera ·
   `W A S D Q E` = FREE-camera move (SHIFT/PgUp fast, PgDn slow) · `+` / `-` = warp ×2/÷2 · `0`–`8` = warp presets (1×…1e8×) ·
-  Space = pause · `.` = sim step · Backspace = epoch reset (J2000) · F5 = scenario restart · V = velocity vectors ·
-  Home = reset view · F1 = full scientific inspector · ESC = quit. (Reverse time is intentionally not offered:
-  the mirrored scientific authority does not define it.)
+  Space = pause · `.` = sim step · Backspace = epoch reset (J2000) · F5 = scenario restart · **F2 = save scenario, F3 = load scenario** (path-safe,
+  `<exe>/saves/scenario_1.json`) · V = velocity-vector overlay · `P` = peri/apo apsis markers · Home = reset view ·
+  F1 = scientific HUD matrix + inspector · ESC = quit. (Reverse time is intentionally not offered: the mirrored
+  scientific authority does not define it.)
+- **v0.4 additions**: scientific HUD data model with explicit `NOT AVAILABLE` rows (title bar + F1 matrix; on-canvas
+  text planned); selection decoupled from camera target with one authoritative `selected_id`; star color consumed from
+  the project LUT (`native_renderer/assets/star_temperature_lut.ppm`, blackbody approximation 2000–40000 K — labeled
+  interpretation, not photometry); classified Cosmic-Audio event bus (UI/sim = CINEMATIC by default; vacuum acoustics
+  and source-less sonification rejected by policy; audible output pending Windows audio run); traversal-safe scenario
+  persistence with strict parsing (unknown/missing keys fail the load).
 - **Inspector**: the title bar always shows focus body, true SI heliocentric distance (AU),
   vis-viva speed (km/s), epoch (J2000 + years), warp, and the classification tag
   (`SIMULATED (Kepler, JPL approx. elements)`). CINEMATIC visual scaling (sublinear

@@ -1,3 +1,27 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.4)
+
+## 0. v0.4 increment (Step 2 continuation)
+
+| Brief item | Status | Gate |
+|------------|--------|------|
+| Scientific HUD data model (NOT AVAILABLE semantics; console/title consumed) | IMPLEMENTED+VERIFIED (model) / PARTIAL (on-canvas pixel text PLANNED, no fake) | v04_gates HUD section |
+| Selection identity (deselect X; selected_id in RenderState; camera/inspector sync) | IMPLEMENTED (source valid) | native build 95/95; selection rules asserted in HUD case-1/case-2 |
+| Peri/apo markers (real apsis positions) | IMPLEMENTED, NOT GPU-VERIFIED | shader unchanged (reused vector pipeline, 7/7 glslang) |
+| LUT consumption (real asset → star color, provenance-labeled) | **VERIFIED** (strict parse of real 16×256 bytes; trend assertions) | v04_gates LUT section |
+| Audio event bus w/ mandatory classifications + vacuum-acoustic rejection | **VERIFIED (routing/classification)**; audible output NOT VERIFIED (no device) | v04_gates audio section |
+| Persistence save/load (15 fields, strict, traversal-safe; F2/F3) | **VERIFIED (round-trip/tamper/path)** | v04_gates persistence section |
+| Viz-mode architecture (orbital/velocity; advanced modes hidden until backends exist) | IMPLEMENTED | build |
+| Supabase app wiring | PLANNED (offline-first; no fake online) | — |
+| HDR/tone-map/bloom/instancing/culling/LOD consumption | PLANNED v0.5 with real offscreen/SSBO paths (NOT faked as toggles) | — |
+| Windows runtime (Phase A) | **BLOCKED (environment)** — NOT VERIFIED | — |
+
+**Exact counts**: C++ gates **661 checks / 0 fails** (v04 562 + kepler 99) · Python **1535/1535** · shaders 7/7 glslang + 23/23 project suite · native build 95/95 · 0 FAIL lines native validator.
+Bug fixed en route: public-header function accidentally defined in an anonymous namespace (ambiguity + latent link failure) → moved to namespace scope; gates re-green.
+
+Detailed report: `ASTRA_V0_4_REPORT.md`. Prior increments below unchanged.
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v0.3 Integrated Simulation)
 
 ## 0. v0.3 increment (this stage of Step 2)

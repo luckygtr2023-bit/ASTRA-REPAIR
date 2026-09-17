@@ -30,6 +30,9 @@ struct RenderState {
     std::vector<ObjectState> objects;
     struct Camera { std::string mode="orbital"; std::string target="planet-1"; } camera;
     std::string quality = "HIGH";
+    // v0.4: single authoritative selection identity ("" = none). Camera,
+    // inspector and highlighting all read from this same identity.
+    std::string selected_id;
 };
 
 class Scene {

@@ -9,8 +9,10 @@ constexpr double TWO_PI = 2.0 * PI;
 constexpr double KEPLER_TOL = 1.0e-12;   // astra/orbital/constants.py KEPLER_TOL
 constexpr int KEPLER_MAX_ITER = 200;     // astra/orbital/constants.py KEPLER_MAX_ITER
 constexpr double DEG = PI / 180.0;
+} // namespace
 
 // Mirror of astra/orbital/elements.py::_rotation_pqw_to_ijk applied to a vector.
+// Public (header-declared) — must live outside the anonymous namespace.
 Vec3d rotation_pqw_to_ijk(double i, double raan, double argp, Vec3d v) {
     const double cO = std::cos(raan), sO = std::sin(raan);
     const double ci = std::cos(i),    si = std::sin(i);
@@ -29,7 +31,6 @@ Vec3d rotation_pqw_to_ijk(double i, double raan, double argp, Vec3d v) {
             m10 * v[0] + m11 * v[1] + m12 * v[2],
             m20 * v[0] + m21 * v[1] + m22 * v[2]};
 }
-} // namespace
 
 double solve_kepler_elliptic(double mean_anomaly, double e) {
     // Mirror of astra/orbital/kepler.py::solve_kepler_elliptic.

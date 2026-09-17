@@ -61,6 +61,9 @@ double mean_motion(const OrbitalElements& el);
 // astra/orbital/elements.py::elements_to_state velocity branch:
 // v_factor = sqrt(mu/p), v_pqw = (-vf sin n, vf (e + cos n), 0) -> IJK).
 Vec3d orbital_velocity(const OrbitalElements& el, double t_s);
+// Mirror of astra/orbital/elements.py::_rotation_pqw_to_ijk (used by the
+// apsis markers to place peri/apo at real positions).
+Vec3d rotation_pqw_to_ijk(double i, double raan, double argp, Vec3d v);
 // True-anomaly sample of the full orbit (for the orbit-path overlay).
 // Returns N evenly spaced (in mean anomaly) parent-frame positions.
 std::vector<Vec3d> orbit_polyline(const OrbitalElements& el, double t_s, int n);

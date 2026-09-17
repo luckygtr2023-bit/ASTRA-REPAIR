@@ -1,4 +1,4 @@
-// ASTRA COSMOS — Production Win32 + Vulkan application (v0.2 Integrated Simulation)
+// ASTRA COSMOS — Production Win32 + Vulkan application (v0.4 Integrated Simulation)
 //
 // One integrated application: the scientific simulation (mirror of the Python
 // authority astra.orbital) drives RenderState; the renderer consumes it every
@@ -6,9 +6,10 @@
 // precision and rebased to renderer floats only at the visualization boundary.
 //
 // Controls (keyboard, see README):
-//   Arrows orbit camera | PgUp/PgDn zoom | Tab/Shift+Tab select body
-//   +/- time warp | Space pause | Home reset view | F1 console inspector
-//   ESC quit
+//   Arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect
+//   O free/follow cam | WASDQE move | +/- warp | 0-8 presets | Space pause
+//   . step | BKSP epoch-reset | F5 restart | F2/F3 save/load | V vectors
+//   P apsis markers | F1 HUD+inspector | ESC quit
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -32,6 +33,10 @@
 // ASTRA application layer (mirror of the Python scientific authority)
 #include "app/celestial_sim.h"
 #include "app/orbit_camera.h"
+#include "app/hud_state.h"
+#include "app/audio_bus.h"
+#include "app/persist.h"
+#include "app/star_lut.h"
 
 // ─── Application state ────────────────────────────────────────────────────────
 static std::vector<astra::app::CelestialBody> g_bodies;
@@ -49,7 +54,15 @@ enum class CamMode { FOLLOW, FREE };
 static CamMode g_cam_mode = CamMode::FOLLOW;
 static float g_free_pos[3] = {0.0f, 0.0f, 0.0f}; // target-relative render units
 static bool g_show_vectors = true;
+static bool g_show_apsis = false;            // peri/apo tick marks (P key)
 static bool g_step_once = false;
+// v0.4: selection is a distinct authoritative identity from the camera target.
+// g_selection = inspector/highlight identity; g_focus = camera target.
+// Tab changes both together (normal exploration), X clears selection only.
+static int g_selection = 3;
+static astra::app::AudioBus g_audio;          // event routing; classified
+static std::string g_viz_mode = "orbital";    // hud-reported visualization mode
+static double g_last_fps = 0.0;               // REAL measured (for HUD/inspector)
 
 // ─── Window state ─────────────────────────────────────────────────────────────
 static HWND g_hwnd = nullptr;
@@ -189,17 +202,77 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         switch (wp) {
         case VK_ESCAPE: g_quit = true; break;
-        case VK_TAB:   focus_body((g_focus + (shift ? -1 : 1) + (int)g_bodies.size()) % (int)g_bodies.size(), true); break;
-        case VK_SPACE: g_clock.paused = !g_clock.paused; break;
+        case VK_TAB: {
+            const int next = (g_focus + (shift ? -1 : 1) + (int)g_bodies.size()) % (int)g_bodies.size();
+            g_selection = next;            // selection identity travels with the camera target on Tab
+            focus_body(next, true);
+            g_audio.push(astra::app::AudioEventKind::UI_SELECT, g_bodies[(size_t)g_selection].name, g_clock.sim_time_s);
+            break;
+        }
+        case 'X':                          // deselect (camera target unchanged)
+            if (g_selection >= 0) {
+                g_selection = -1;
+                g_audio.push(astra::app::AudioEventKind::UI_DESELECT, "selection", g_clock.sim_time_s);
+            }
+            break;
+        case VK_SPACE:
+            g_clock.paused = !g_clock.paused;
+            g_audio.push(g_clock.paused ? astra::app::AudioEventKind::SIM_PAUSE
+                                        : astra::app::AudioEventKind::SIM_RESUME, "clock", g_clock.sim_time_s);
+            break;
         case VK_HOME:  focus_body(g_focus, true); break;
-        case VK_OEM_PLUS: case VK_ADD:      g_clock.warp = astra::app::SimClock::clamp_warp(g_clock.warp * 2.0); break;
-        case VK_OEM_MINUS: case VK_SUBTRACT: g_clock.warp = astra::app::SimClock::clamp_warp(g_clock.warp / 2.0); break;
-        case VK_OEM_PERIOD: g_step_once = true; break;          // single sim step
-        case VK_BACK:    g_clock.sim_time_s = 0.0; break;       // reset to epoch J2000
-        case VK_F5:      g_clock.sim_time_s = 0.0; g_clock.paused = false; break; // scenario restart (clock only; scenario state recomputed from elements)
+        case VK_OEM_PLUS: case VK_ADD:
+            g_clock.warp = astra::app::SimClock::clamp_warp(g_clock.warp * 2.0);
+            g_audio.push(astra::app::AudioEventKind::SIM_WARP, "clock", g_clock.sim_time_s);
+            break;
+        case VK_OEM_MINUS: case VK_SUBTRACT:
+            g_clock.warp = astra::app::SimClock::clamp_warp(g_clock.warp / 2.0);
+            g_audio.push(astra::app::AudioEventKind::SIM_WARP, "clock", g_clock.sim_time_s);
+            break;
+        case VK_OEM_PERIOD: g_step_once = true; g_audio.push(astra::app::AudioEventKind::SIM_STEP, "clock", g_clock.sim_time_s); break;
+        case VK_BACK:    g_clock.sim_time_s = 0.0; g_audio.push(astra::app::AudioEventKind::SIM_RESET, "clock", g_clock.sim_time_s); break;
+        case VK_F5:      g_clock.sim_time_s = 0.0; g_clock.paused = false; g_audio.push(astra::app::AudioEventKind::SIM_RESTART, "clock", g_clock.sim_time_s); break;
+        case VK_F2: {    // F2 save scenario (persistence; traversal-safe names)
+            astra::app::ScenarioSave s{};
+            s.sim_time_s = g_clock.sim_time_s; s.warp = g_clock.warp; s.paused = g_clock.paused;
+            s.focus = g_focus; s.selection = g_selection;
+            s.cam_mode = (g_cam_mode == CamMode::FREE) ? 1 : 0;
+            s.cam_azimuth = g_camera.azimuth; s.cam_elevation = g_camera.elevation; s.cam_distance = g_camera.distance;
+            for (int k = 0; k < 3; ++k) s.free_pos[k] = g_free_pos[k];
+            s.show_vectors = g_show_vectors; s.viz_mode = g_viz_mode;
+            CreateDirectoryA((exe_dir() + "\\saves").c_str(), nullptr);
+            if (astra::app::save_scenario_file(exe_dir() + "\\saves", "scenario_1.json", s)) {
+                printf("[ASTRA] Scenario saved: %s\\saves\\scenario_1.json\n", exe_dir().c_str());
+                g_audio.push(astra::app::AudioEventKind::SCENARIO_SAVE, "scenario_1", g_clock.sim_time_s);
+            } else {
+                printf("[ASTRA] Scenario save FAILED (disk)\n");
+            }
+            break;
+        }
+        case VK_F3: {    // F3 load scenario (strict parse: no silent state discard)
+            astra::app::ScenarioSave s{};
+            if (astra::app::load_scenario_file(exe_dir() + "\\saves", "scenario_1.json", s)) {
+                g_clock.sim_time_s = s.sim_time_s; g_clock.warp = s.warp; g_clock.paused = s.paused;
+                g_focus = std::clamp(s.focus, 0, (int)g_bodies.size() - 1);
+                g_selection = (s.selection >= 0 && s.selection < (int)g_bodies.size()) ? s.selection : -1;
+                g_cam_mode = (s.cam_mode == 1) ? CamMode::FREE : CamMode::FOLLOW;
+                g_camera.azimuth = s.cam_azimuth; g_camera.elevation = s.cam_elevation;
+                g_camera.distance = s.cam_distance;
+                for (int k = 0; k < 3; ++k) g_free_pos[k] = s.free_pos[k];
+                g_show_vectors = s.show_vectors; g_viz_mode = s.viz_mode;
+                printf("[ASTRA] Scenario loaded: sim=%.3f d warp=x%.0f focus=%s sel=%s\n",
+                       s.sim_time_s / 86400.0, s.warp, g_bodies[(size_t)g_focus].name.c_str(),
+                       g_selection >= 0 ? g_bodies[(size_t)g_selection].name.c_str() : "none");
+                g_audio.push(astra::app::AudioEventKind::SCENARIO_LOAD, "scenario_1", g_clock.sim_time_s);
+            } else {
+                printf("[ASTRA] Scenario load: no valid save at %s\\saves\\scenario_1.json (NOT AVAILABLE)\n", exe_dir().c_str());
+            }
+            break;
+        }
         case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': {
             const double warp_lut[] = {1.0, 10.0, 100.0, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8};
             g_clock.warp = warp_lut[wp - '0'];
+            g_audio.push(astra::app::AudioEventKind::SIM_WARP, "clock", g_clock.sim_time_s);
             break;
         }
         case 'O': {
@@ -210,9 +283,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else {
                 g_cam_mode = CamMode::FOLLOW;
             }
+            g_audio.push(astra::app::AudioEventKind::UI_MODE, "camera", g_clock.sim_time_s);
             break;
         }
-        case 'V': g_show_vectors = !g_show_vectors; break;
+        case 'V': g_show_vectors = !g_show_vectors; g_viz_mode = g_show_vectors ? "velocity" : "orbital"; break;
+        case 'P': g_show_apsis = !g_show_apsis; break;   // peri/apo tick marks
         case VK_F1: {
             extern void dump_inspector();
             dump_inspector();
@@ -824,6 +899,11 @@ static void sim_tick(double real_dt_s) {
              (float)g_bodies[i].mass_kg, 0,
              {g_vel[i][0], g_vel[i][1], g_vel[i][2]}});
     }
+    // Single selection identity across camera/inspector/RenderState/highlight.
+    g_scene.state.selected_id = (g_selection >= 0 && g_selection < (int)g_bodies.size())
+        ? g_bodies[(size_t)g_selection].name : "";
+    g_scene.state.camera.mode = (g_cam_mode == CamMode::FOLLOW) ? "orbit-follow" : "free";
+    g_scene.state.camera.target = g_bodies[(size_t)g_focus].name;
 }
 
 static void focus_body(int idx, bool reset_view) {
@@ -877,28 +957,59 @@ static void update_camera_from_input(double real_dt_s) {
     }
 }
 
+// v0.4: HUD snapshot from authoritative state (single mapping, tested by
+// native_renderer/tests/v04_gates.cpp: NOT AVAILABLE semantics included).
+static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
+    astra::app::HudSnapshot s{};
+    s.sim_time_s = g_clock.sim_time_s;
+    s.warp = g_clock.warp;
+    s.paused = g_clock.paused;
+    s.fps = fps;
+    s.frame_ms = frame_ms;
+    s.cam_mode = (g_cam_mode == CamMode::FREE) ? 1 : 0;
+    s.reference_frame = "heliocentric";
+    s.viz_mode = g_viz_mode;
+    s.selected_index = g_selection;
+    if (g_selection >= 0 && g_selection < (int)g_bodies.size()) {
+        const auto& b = g_bodies[(size_t)g_selection];
+        s.selected_name = b.name;
+        s.selected_classification = b.classification;
+        s.has_selected_kind = true;
+        s.selected_kind = b.kind == astra::app::BodyKind::STAR ? "STAR"
+                         : b.kind == astra::app::BodyKind::PLANET ? "PLANET" : "MOON";
+        const astra::app::Vec3d& w = g_world[(size_t)g_selection];
+        const astra::app::Vec3d& v = g_vel[(size_t)g_selection];
+        const astra::app::Vec3d& tw = g_world[(size_t)g_focus]; // observer = camera target
+        s.has_selected_state = true;
+        s.r_helio_km = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+        s.speed_km_s = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+        s.observer_distance_km = std::sqrt((w[0]-tw[0])*(w[0]-tw[0]) + (w[1]-tw[1])*(w[1]-tw[1]) + (w[2]-tw[2])*(w[2]-tw[2]));
+        s.light_delay_s = s.observer_distance_km / 299792.458;
+    }
+    return s;
+}
+
 static void update_inspector_title(double fps) {
-    const auto& b = g_bodies[(size_t)g_focus];
-    const astra::app::Vec3d& w = g_world[(size_t)g_focus];
-    const astra::app::Vec3d& v = g_vel[(size_t)g_focus];
-    const double r = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
-    const double speed = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
-    const double years = g_clock.sim_time_s / astra::app::DAY_S / astra::app::YEAR_D;
-    char title[512];
-    snprintf(title, sizeof(title),
-        "ASTRA COSMOS v0.3 — %s | r=%.4f AU v=%.2f km/s | epoch J2000%+.2f yr | warp x%.0f %s | cam=%s | frame=heliocentric | %.0f fps | SIMULATED (Kepler, JPL approx.)",
-        b.name.c_str(), r / astra::app::AU_KM, speed, years, g_clock.warp,
-        g_clock.paused ? "PAUSED" : "",
-        g_cam_mode == CamMode::FOLLOW ? "orbit-follow" : "free", fps);
-    SetWindowTextA(g_hwnd, title);
+    static double frame_ms = 0.0;
+    frame_ms = (fps > 1e-6) ? 1000.0 / fps : 0.0;
+    const auto snap = make_hud_snapshot(fps, frame_ms);
+    const std::string line = astra::app::hud_summary_line(snap);
+    // v0.4 title: single-line scientific HUD (full matrix on F1).
+    SetWindowTextA(g_hwnd, ("ASTRA COSMOS v0.4  " + line).c_str());
 }
 
 void dump_inspector() {
+    // v0.4: HUD matrix first (authoritative mapping incl. NOT AVAILABLE).
+    const auto snap = make_hud_snapshot(g_last_fps, (g_last_fps > 1e-6) ? 1000.0 / g_last_fps : 0.0);
+    const auto hud_lines = astra::app::render_hud_lines(astra::app::build_hud(snap));
+    printf("\n[ASTRA] ═══ SCIENTIFIC HUD ═══\n");
+    for (const auto& l : hud_lines) printf("[HUD] %s\n", l.c_str());
     printf("\n[ASTRA] ═══ SCIENTIFIC INSPECTOR (sim epoch J2000 %+.4f yr = sim %+.2f d) ═══\n",
            g_clock.sim_time_s / astra::app::DAY_S / astra::app::YEAR_D,
            g_clock.sim_time_s / astra::app::DAY_S);
-    printf("[ASTRA] Focus: %s · camera=%s · warp=x%.0f %s\n",
+    printf("[ASTRA] Focus(camera)=%s  Selection=%s · cam=%s · warp=x%.0f %s\n",
            g_bodies[(size_t)g_focus].name.c_str(),
+           (g_selection >= 0) ? g_bodies[(size_t)g_selection].name.c_str() : "none",
            g_cam_mode == CamMode::FOLLOW ? "orbit-follow" : "free",
            g_clock.warp, g_clock.paused ? "PAUSED" : "");
     for (size_t i = 0; i < g_bodies.size(); ++i) {
@@ -1055,8 +1166,9 @@ static bool render_frame(double fps) {
         pc.bodyPosRad[0] = rpos[i][0]; pc.bodyPosRad[1] = rpos[i][1]; pc.bodyPosRad[2] = rpos[i][2]; pc.bodyPosRad[3] = r;
         pc.sunPosEmis[0] = sunx; pc.sunPosEmis[1] = suny; pc.sunPosEmis[2] = sunz;
         pc.sunPosEmis[3] = (g_bodies[i].kind == astra::app::BodyKind::STAR) ? 1.0f : 0.0f;
-        // Selection highlight: focused body brightness +30% (UI only; no sim effect).
-        const float boost = ((int)i == g_focus) ? 1.3f : 1.0f;
+        // Selection highlight: selected body brightness +30% (UI only; single
+        // authoritative identity g_selection; no sim effect).
+        const float boost = ((int)i == g_selection) ? 1.3f : 1.0f;
         pc.color[0] = std::min(1.0f, g_bodies[i].color[0] * boost);
         pc.color[1] = std::min(1.0f, g_bodies[i].color[1] * boost);
         pc.color[2] = std::min(1.0f, g_bodies[i].color[2] * boost);
@@ -1083,10 +1195,10 @@ static bool render_frame(double fps) {
             pc.e2[0] = (float)el.argp; pc.e2[1] = (float)M; pc.e2[2] = (float)POS_SCALE; pc.e2[3] = 0.0f;
             const auto& pw = rpos[(size_t)b.parent >= 0 ? (size_t)b.parent : 0];
             pc.parent[0] = pw[0]; pc.parent[1] = pw[1]; pc.parent[2] = pw[2]; pc.parent[3] = 0.0f;
-            const bool focused = ((int)i == g_focus);
-            pc.color[0] = g_bodies[i].color[0] * (focused ? 1.0f : 0.45f);
-            pc.color[1] = g_bodies[i].color[1] * (focused ? 1.0f : 0.45f);
-            pc.color[2] = g_bodies[i].color[2] * (focused ? 1.0f : 0.45f);
+            const bool selected = ((int)i == g_selection);
+            pc.color[0] = g_bodies[i].color[0] * (selected ? 1.0f : 0.45f);
+            pc.color[1] = g_bodies[i].color[1] * (selected ? 1.0f : 0.45f);
+            pc.color[2] = g_bodies[i].color[2] * (selected ? 1.0f : 0.45f);
             pc.color[3] = 1.0f;
             vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);
@@ -1106,11 +1218,44 @@ static bool render_frame(double fps) {
             pc.originScale[0] = rpos[i][0]; pc.originScale[1] = rpos[i][1]; pc.originScale[2] = rpos[i][2];
             pc.originScale[3] = (float)(VisualVectorScale(vmag));
             pc.velocity[0] = (float)g_vel[i][0]; pc.velocity[1] = (float)g_vel[i][1]; pc.velocity[2] = (float)g_vel[i][2]; pc.velocity[3] = 0.0f;
-            const bool focused = ((int)i == g_focus);
-            pc.color[0] = 0.4f; pc.color[1] = focused ? 1.0f : 0.8f; pc.color[2] = 0.3f; pc.color[3] = 1.0f;
+            const bool selected_b = ((int)i == g_selection);
+            pc.color[0] = 0.4f; pc.color[1] = selected_b ? 1.0f : 0.8f; pc.color[2] = 0.3f; pc.color[3] = 1.0f;
             vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);
             vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+        }
+    }
+
+    // ── 5. Peri/apo tick marks (real apsis positions from elements; P key) ──
+    if (g_show_apsis) {
+        vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_vector);
+        struct VectorPC { astra::app::Mat4 viewProj; float originScale[4]; float velocity[4]; float color[4]; };
+        for (size_t i = 1; i < g_bodies.size(); ++i) {
+            const auto& el = g_bodies[i].elements;
+            if (!(el.a_km > 0.0)) continue; // apsis unavailable for the primary
+            const double peri = el.a_km * (1.0 - el.e);
+            const double apo = el.a_km * (1.0 + el.e);
+            // Apsis directions in the orbit plane (nu=0 -> peri, nu=pi -> apo)
+            // through the same PQW->IJK rotation as the scientific engine.
+            const astra::app::Vec3d dir_p = astra::app::rotation_pqw_to_ijk(el.i, el.raan, el.argp, {peri, 0.0, 0.0});
+            const astra::app::Vec3d dir_a = astra::app::rotation_pqw_to_ijk(el.i, el.raan, el.argp, {-apo, 0.0, 0.0});
+            const astra::app::Vec3d& pw = g_world[(size_t)g_bodies[i].parent >= 0 ? (size_t)g_bodies[i].parent : 0];
+            const float mp[2][3] = {
+                {(float)((pw[0] + dir_p[0] - target[0]) * POS_SCALE), (float)((pw[1] + dir_p[1] - target[1]) * POS_SCALE), (float)((pw[2] + dir_p[2] - target[2]) * POS_SCALE)},
+                {(float)((pw[0] + dir_a[0] - target[0]) * POS_SCALE), (float)((pw[1] + dir_a[1] - target[1]) * POS_SCALE), (float)((pw[2] + dir_a[2] - target[2]) * POS_SCALE)}};
+            for (int m = 0; m < 2; ++m) {
+                VectorPC pc{};
+                pc.viewProj = view_proj;
+                pc.originScale[0] = mp[m][0]; pc.originScale[1] = mp[m][1]; pc.originScale[2] = mp[m][2];
+                pc.originScale[3] = (m == 0 ? 0.55f : 0.40f); // tick lengths
+                // Global +Y tick direction (orientation is presentational; the
+                // apsis POSITION is scientific).
+                pc.velocity[0] = 0.0f; pc.velocity[1] = 1.0f; pc.velocity[2] = 0.0f; pc.velocity[3] = 0.0f;
+                pc.color[0] = (m == 0) ? 1.0f : 0.55f; pc.color[1] = 0.85f; pc.color[2] = (m == 0) ? 0.35f : 1.0f; pc.color[3] = 1.0f;
+                vkCmdPushConstants(g_cmd_buf, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(pc), &pc);
+                vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+            }
         }
     }
 
@@ -1181,13 +1326,34 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
-    printf("[ASTRA] ASTRA COSMOS v0.3 — Integrated scientific simulation (follow/free camera, velocity vectors, full inspector)\n");
+    printf("[ASTRA] ASTRA COSMOS v0.4 — HUD model, audio bus, persistence, LUT, apsis markers, selection/deselect\n");
 
     // Scientific scenario (Python engine remains the authority; this native
     // mirror reproduces astra.orbital exactly — see app/celestial_sim.h).
     g_bodies = astra::app::make_solar_system();
     g_world = astra::app::propagate_world(g_bodies, g_clock.sim_time_s);
     g_vel = astra::app::propagate_world_velocity(g_bodies, g_clock.sim_time_s);
+    // Phase R: consume the project star-temperature LUT for the star's visual
+    // color (blackbody-approx 2000..40kK, provenance: generate_lut.py, CC0).
+    {
+        astra::app::RgbF star_c{};
+        const std::string luts[] = {exe_dir() + "\\assets\\star_temperature_lut.ppm",
+                                    "assets\\star_temperature_lut.ppm",
+                                    "..\\assets\\star_temperature_lut.ppm",
+                                    "native_renderer\\assets\\star_temperature_lut.ppm"};
+        bool applied = false;
+        for (const auto& p : luts) {
+            if (astra::app::star_color_from_file(p, g_bodies[0].temperature_k, star_c)) {
+                g_bodies[0].color[0] = star_c.r; g_bodies[0].color[1] = star_c.g; g_bodies[0].color[2] = star_c.b;
+                printf("[ASTRA] Star color from LUT %s (T_eff=%.0fK -> %.3f %.3f %.3f, blackbody approx)\n",
+                       p.c_str(), g_bodies[0].temperature_k, star_c.r, star_c.g, star_c.b);
+                applied = true;
+                break;
+            }
+        }
+        if (!applied)
+            printf("[ASTRA] Star LUT NOT AVAILABLE (assets/star_temperature_lut.ppm) — keeping table color (CINEMATIC)\n");
+    }
     focus_body(3, true); // Earth
     printf("[ASTRA] Scenario: solar system (%zu bodies, epoch J2000, Kepler two-body)\n", g_bodies.size());
 
@@ -1204,7 +1370,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!create_geometry())   { printf("[ASTRA] Geometry failed\n"); cleanup(); return 1; }
     if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    printf("[ASTRA] v0.3 controls: arrows look | PgUp/PgDn zoom/speed | Tab body | O free/orbit cam | WASDQE move | +/- warp | 0-8 warp presets | Space pause | . step | BKSP epoch-reset | F5 restart | V vectors | F1 inspector | ESC quit\n");
+    printf("[ASTRA] v0.4 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | F1 HUD+inspector | ESC quit\n");
     dump_inspector();
 
     auto t_prev = std::chrono::high_resolution_clock::now();
@@ -1225,10 +1391,23 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (real_dt > 0.25) real_dt = 0.25; // avoid spiral after breakpoints
         t_prev = t_now;
         if (real_dt > 1e-6) fps = 0.9 * fps + 0.1 * (1.0 / real_dt);
+        g_last_fps = fps;
 
         update_camera_from_input(real_dt);
         sim_tick(real_dt);
         update_inspector_title(fps);
+
+        // Cosmic Audio routing (v0.4): every simulation/UI event surfaced with
+        // its mandatory provenance classification. Audible output on Windows:
+        // NOT VERIFIED in this environment (classification/routing gates pass).
+        for (int k = 0; k < 4; ++k) {
+            astra::app::AudioEvent ev{};
+            if (!g_audio.pop(ev)) break;
+            printf("[ASTRA-AUDIO] %-18s %-24s [%s] t=%+9.2fd subject=%s\n",
+                   astra::app::audio_event_kind_name(ev.kind),
+                   "classified", astra::app::audio_class_name(ev.classification),
+                   ev.sim_time_s / 86400.0, ev.subject.c_str());
+        }
 
         if (!render_frame(fps)) {
             printf("[ASTRA] Render failed\n");
