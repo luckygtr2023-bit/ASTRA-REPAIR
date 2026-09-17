@@ -1,41 +1,73 @@
 #version 450
-// ASTRA COSMOS v0.5 — GPU visibility / LOD classification.
-// Writes a DETERMINISTIC per-body slot (no atomics, no compaction order):
-// mask[i] = 0 (invisible) | 1 (LOW-LOD batch) | 2 (HIGH-LOD batch).
-// The rule is the float mirror of app/render_math.cpp (documented policy).
-// Visibility affects ONLY visualization draws; scientific state untouched.
+// ASTRA COSMOS v0.6 — GPU-driven visibility/LOD: classification + DETERMINISTIC
+// compaction + indirect command generation (single workgroup, thread 0 serial
+// order pass; identical to the CPU mirror app/render_math.cpp::compact_lod).
+//
+// Outputs:
+//   b1: mask (debug/HUD readback)
+//   b2: LOW batch instance list  (compacted)
+//   b3: HIGH batch instance list (compacted)
+//   b4: indirect commands [2] = VkDrawIndexedIndirectCommand-compatible
+//
+// Zero-visible is safe: instanceCount=0 commands are no-ops. Determinism: the
+// order pass is serial (thread 0), shared-memory staging only.
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 128) in;
 
 layout(push_constant) uniform CullPC {
     mat4 viewProj;
-    vec4 params;  // x = body count, y = tan(half FOV)
-    vec4 eye;     // xyz = camera eye in render (target-relative) units
+    vec4 params;  // x = body count (<=128), y = tan(half FOV)
+    vec4 eye;     // xyz = camera eye (render, target-relative)
 } pc;
 
 struct BodyInstance { vec4 pos_radius; vec4 color_flag; };
 layout(std430, binding = 0) readonly buffer Instances { BodyInstance inst[]; };
 layout(std430, binding = 1) writeonly buffer LodMask { uint mask[]; };
+layout(std430, binding = 2) writeonly buffer LowList  { BodyInstance low_list[]; };
+layout(std430, binding = 3) writeonly buffer HighList { BodyInstance high_list[]; };
+struct IndirectCmd { uint index_count, instance_count, first_index; int vertex_offset; uint first_instance; };
+layout(std430, binding = 4) writeonly buffer Commands { IndirectCmd cmd[2]; };
+
+// Deterministic serial compaction into shared memory (thread 0).
+shared uint s_order[128];
+shared uint s_low_n, s_high_n;
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= uint(pc.params.x)) return;
-    vec3 c = inst[i].pos_radius.xyz;
-    float r = inst[i].pos_radius.w;
-    vec4 clip = pc.viewProj * vec4(c, 1.0);
-    uint lod = 0;
-    if (clip.w > 0.0) {
-        // projective AABB test: |x| < w + r*|colx|, etc. (sphere vs frustum;
-        // equivalent to CPU mirror plane test for this perspective matrix)
-        float rx = length(vec3(pc.viewProj[0][0], pc.viewProj[0][1], pc.viewProj[0][2]));
-        float ry = length(vec3(pc.viewProj[1][0], pc.viewProj[1][1], pc.viewProj[1][2]));
-        float rz = length(vec3(pc.viewProj[2][0], pc.viewProj[2][1], pc.viewProj[2][2]));
-        if (abs(clip.x) < clip.w + r * rx && abs(clip.y) < clip.w + r * ry &&
-            clip.z > -r * rz && clip.z < clip.w + r * rz) {
-            float dist = max(length(c - pc.eye.xyz), 1e-4);  // camera-relative distance
-            float frac = r / (dist * pc.params.y);           // screen-height fraction
-            lod = (frac > 0.010) ? 2u : 1u;                  // mirror of lod_select()
+    uint i = gl_GlobalInvocationID.x;      // == gl_LocalInvocationID.x (1 group)
+    uint n = uint(pc.params.x);
+
+    if (i == 0u) { s_low_n = 0u; s_high_n = 0u; }
+    barrier();
+
+    // Thread 0: classify all bodies serially (deterministic) and emit order.
+    if (i == 0u) {
+        for (uint k = 0u; k < n; ++k) {
+            vec3 c = inst[k].pos_radius.xyz;
+            float r = inst[k].pos_radius.w;
+            vec4 clip = pc.viewProj * vec4(c, 1.0);
+            uint lod = 0u;
+            if (clip.w > 0.0) {
+                float rx = length(vec3(pc.viewProj[0][0], pc.viewProj[0][1], pc.viewProj[0][2]));
+                float ry = length(vec3(pc.viewProj[1][0], pc.viewProj[1][1], pc.viewProj[1][2]));
+                float rz = length(vec3(pc.viewProj[2][0], pc.viewProj[2][1], pc.viewProj[2][2]));
+                if (abs(clip.x) < clip.w + r * rx && abs(clip.y) < clip.w + r * ry &&
+                    clip.z > -r * rz && clip.z < clip.w + r * rz) {
+                    float dist = max(length(c - pc.eye.xyz), 1e-4);
+                    float frac = r / (dist * pc.params.y);
+                    lod = (frac > 0.010) ? 2u : 1u;   // mirror of lod_select() (1%)
+                }
+            }
+            mask[k] = lod;
+            s_order[k] = lod;
         }
+        // Serial compaction: LOW first (stable order), then HIGH.
+        for (uint k = 0u; k < n; ++k) {
+            if (s_order[k] == 1u) { low_list[s_low_n] = inst[k]; s_order[k] = 0xFFFFFFFFu; s_low_n++; }
+        }
+        for (uint k = 0u; k < n; ++k) {
+            if (s_order[k] == 2u) { high_list[s_high_n] = inst[k]; s_high_n++; }
+        }
+        cmd[0] = IndirectCmd(uint(pc.params.z), s_low_n, 0u, 0, 0u);   // LOW indexCount
+        cmd[1] = IndirectCmd(uint(pc.params.w), s_high_n, 0u, 0, 0u);  // HIGH indexCount
     }
-    mask[i] = lod;
 }

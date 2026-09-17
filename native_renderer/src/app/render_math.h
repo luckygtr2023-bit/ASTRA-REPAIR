@@ -48,7 +48,48 @@ struct BodyInstance {
 static_assert(sizeof(BodyInstance) == 32, "SSBO layout contract");
 
 // Pack one instance from authoritative inputs (tested against invariants).
+// v0.6: color_flag.w = (selected ? 1 : 0) + (emissive ? 2 : 0) — the shader
+// decodes both bits (emissive = w >= 1.5; selected = remainder >= 0.5).
 BodyInstance pack_body_instance(float rx, float ry, float rz, float radius,
-                                float cr, float cg, float cb, bool selected);
+                                float cr, float cg, float cb, bool selected,
+                                bool emissive = false);
+
+// ── v0.6 additions ────────────────────────────────────────────────────────────
+
+// Half-resolution policy for the bloom chain (>= 1 px, deterministic).
+struct Extent2 { uint32_t w, h; };
+Extent2 half_extent(Extent2 e);
+
+// Deterministic compaction mirror of cull.comp (single workgroup, serial
+// thread-0 pass): given per-body lod classes (0=hidden,1=LOW,2=HIGH), produce
+// the exact same output ordering (LOW list then HIGH list), and the two
+// indirect draw commands that the shader writes.
+struct CompactResult {
+    uint32_t low_count = 0;
+    uint32_t high_count = 0;
+    uint32_t low_order[128];   // source indices in LOW list order
+    uint32_t high_order[128];  // source indices in HIGH list order
+};
+bool compact_lod(const uint8_t* lod_classes, uint32_t n, CompactResult& out);
+
+// Plain mirror cof VkDrawIndexedIndirectCommand (no Vulkan types in app layer).
+struct IndirectCmd {
+    uint32_t indexCount;
+    uint32_t instanceCount;
+    uint32_t firstIndex;
+    int32_t  vertexOffset;
+    uint32_t firstInstance;
+};
+// Builds the two commands from a compaction result (same values the shader emits).
+void build_indirect_commands(const CompactResult& r, uint32_t low_idx_count, uint32_t high_idx_count,
+                             IndirectCmd& out_low, IndirectCmd& out_high);
+
+// Reference-frame axes + selection marker geometry (render units; deterministic).
+struct Seg3 { float x0, y0, z0, x1, y1, z1; };
+// Three axes X/Y/Z of length L centered at the target-relative origin.
+void make_axes_segments(float origin[3], float L, Seg3 out3[3]);
+// Selection crosshair: 2 perpendicular line segments in the XY plane (rendered
+// in body-local orientation; length = visual_radius * 1.6).
+void make_selection_marker(float center[3], float half_span, Seg3 out2[2]);
 
 } // namespace astra::app

@@ -1,4 +1,24 @@
-# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.5)
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.6)
+
+## 0. v0.6 STABILIZATION increment (Step 2 continuation)
+
+Full report: `ASTRA_V0_6_REPORT.md`. No GPU/Windows/network here — runtime
+statuses stay NOT VERIFIED; source-level paths are REAL (no mocks/stubs).
+
+| Brief item | Status | Evidence |
+|------------|--------|----------|
+| In-canvas HUD (authoritative hud_state rows, NOT AVAILABLE semantics) | IMPLEMENTED, SOURCE-VERIFIED + 625-check gates; RUNTIME NOT VERIFIED | `app/hud_text`, `hud_text.vert/frag`, LINE_LIST pool 32,768 verts, H key |
+| GPU-driven draw path (compact lists + 2 indirect commands, no CPU list regen) | IMPLEMENTED (full vkCmdDrawIndexedIndirect), SOURCE-VERIFIED; RUNTIME NOT VERIFIED | `cull.comp` serial deterministic compaction; static_assert VkDrawIndexedIndirectCommand; CPU mirror gated |
+| Bloom hardening (half-res chain) | IMPLEMENTED, SOURCE-VERIFIED; RUNTIME NOT VERIFIED | `half_extent` policy gated; resize path re-verified |
+| Real star catalog | DATA NOT AVAILABLE (no catalog in repo, no network) — procedural starfield LABELLED, gap documented | Phase 0 search + recorded download attempt |
+| Overlay hardening (axes, selection marker, apsis, vectors) | IMPLEMENTED, SOURCE-VERIFIED + gates | `make_axes_segments`, `make_selection_marker` (pure, deterministic) |
+| Renderer diagnostics (API/device/limits/swapchain, real) | IMPLEMENTED | startup DIAG lines from driver properties |
+| Windows/GPU (Phase 10) | BLOCKED | unchanged |
+
+Counts: v04 562/562 · v05 2984/2984 · v06 625/625 · kepler 99/99 · pytest 1535/1535 · build [8/8] · shaders 13/13 + 19/0 · syntax 0 errors vs Vulkan 1.4.362.
+
+---
+
 
 ## 0. v0.5 REAL RENDERING increment (Step 2 continuation)
 

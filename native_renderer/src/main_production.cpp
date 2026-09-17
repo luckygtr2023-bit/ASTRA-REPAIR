@@ -1,28 +1,31 @@
-// ASTRA COSMOS — Production Win32 + Vulkan application (v0.5 REAL RENDERING)
+// ASTRA COSMOS — Production Win32 + Vulkan application (v0.6 STABILIZATION)
 //
 // One integrated application: the scientific simulation (mirror of the Python
 // authority astra.orbital) drives RenderState; the renderer consumes it every
 // frame. No mock Vulkan. Positions/times are simulated truthfully in double
 // precision and rebased to renderer floats only at the visualization boundary.
 //
-// v0.5 real-rendering pipeline (all paths genuine, GPU-executed):
-//   HDR scene pass (R16G16B16A16_SFLOAT + depth, capability-gated, explicit
-//   failure — no silent 8-bit fallback) -> bright-pass -> separable blur H/V
-//   -> composite (ACES-approx display transform + exposure) -> SRGB swapchain
-//   (hardware sRGB conversion; no manual gamma duplication).
-//   Instancing: all bodies in ONE instance SSBO (32B/record, RenderState-
-//   derived), TWO vkCmdDrawIndexed calls per frame (LOW + HIGH LOD batches).
-//   Visibility/LOD: real compute dispatch writing a deterministic per-body
-//   mask slot (same rule as app/render_math CPU twin; zero-host-read; host
-//   reads the mask +1 frame solely for the HUD counters).
-//   LOD: subdivision-1 (240 idx) vs subdivision-2 (960 idx) icospheres chosen
-//   by screen-height fraction (documented threshold 1%, FOV-dependent).
+// v0.5 pipeline: HDR16F scene -> bright -> blur H/V -> ACES-approx + exposure
+// -> SRGB swapchain (hardware EOTF). v0.6 completes the GPU-driven path and
+// adds the in-canvas HUD:
+//   CULL.COMP (single workgroup): classify (frustum) -> deterministic serial
+//   compaction into LOW/HIGH instance lists (thread-0 order pass; mirror of
+//   app/render_math.cpp) -> write 2 indirect draw commands. Draw side issues
+//   ONLY vkCmdDrawIndexedIndirect (no CPU list regeneration after culling).
+//   IN-CANVAS HUD: stroke text rendered in the HDR scene pass from the
+//   authoritative HudState rows (hud_state.h — same mapping as console/title;
+//   NOT AVAILABLE and classification semantics preserved; self-authored 5x8
+//   stroke font, no third-party font data).
+//   Bloom at half resolution (deterministic half_extent policy, gated).
+//   Starfield: procedural/CINEMATIC label retained — NO real star catalog
+//   exists in this repository and this environment has no network access;
+//   catalog ingestion is documented as a missing-data dependency.
 //
 // Controls (keyboard, see README):
 //   Arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect
 //   O free/follow cam | WASDQE move | +/- warp | 0-8 presets | Space pause
 //   . step | BKSP epoch-reset | F5 restart | F2/F3 save/load | V vectors
-//   P apsis markers | [ ] exposure | F1 HUD+inspector | ESC quit
+//   P apsis markers | G axes | H HUD toggle | [ ] exposure | F1 inspector | ESC quit
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -51,6 +54,7 @@
 #include "app/persist.h"
 #include "app/star_lut.h"
 #include "app/render_math.h"
+#include "app/hud_text.h"
 
 // ─── Application state ────────────────────────────────────────────────────────
 static std::vector<astra::app::CelestialBody> g_bodies;
@@ -144,13 +148,37 @@ static VkBuffer g_mask_buf = VK_NULL_HANDLE;         // uint32[INSTANCE_CAPACITY
 static VkDeviceMemory g_mask_mem = VK_NULL_HANDLE;
 static void* g_mask_mapped = nullptr;                // host reads GPU results +1 frame (HUD only)
 
+// v0.6 GPU-driven path: compacted batch lists + indirect command buffer.
+static VkBuffer g_low_buf = VK_NULL_HANDLE;          // BodyInstance[CAP] (compute-written)
+static VkDeviceMemory g_low_mem = VK_NULL_HANDLE;
+static VkBuffer g_high_buf = VK_NULL_HANDLE;         // BodyInstance[CAP] (compute-written)
+static VkDeviceMemory g_high_mem = VK_NULL_HANDLE;
+static VkBuffer g_indirect_buf = VK_NULL_HANDLE;     // 2 x VkDrawIndexedIndirectCommand (20B stride)
+static VkDeviceMemory g_indirect_mem = VK_NULL_HANDLE;
+
+// v0.6 in-canvas HUD stroke-text vertex pool (host-coherent, rewritten per frame).
+static constexpr uint32_t HUD_VERTEX_CAPACITY = 32768; // ~21k verts typical full HUD
+static VkBuffer g_hud_vb = VK_NULL_HANDLE;           // {vec2 xy, float colorIdx} = 12 B/vertex
+static VkDeviceMemory g_hud_vb_mem = VK_NULL_HANDLE;
+static void* g_hud_vb_mapped = nullptr;
+static uint32_t g_hud_vertex_count = 0;
+static bool g_hud_enabled = true;                    // H key toggles (default ON)
+static VkPipeline g_pipe_hud = VK_NULL_HANDLE;       // LINE_LIST stroke text (scene pass, no depth)
+
+// v0.6 bloom at half resolution (minimally-scaled chain; deterministic policy).
+static VkExtent2D g_bright_extent = {1, 1};          // half_extent(g_sc_extent) at creation
+
+// v0.6 overlay toggles (CINEMATIC display helpers; scientific values untouched).
+static bool g_show_axes = true;                      // G key: reference-frame axes
+
 // v0.5 descriptors (first real descriptor infra in the production app)
 static VkDescriptorPool g_desc_pool = VK_NULL_HANDLE;
 static VkDescriptorSetLayout g_dsl_mesh = VK_NULL_HANDLE;     // 2x SSBO (VERTEX)
 static VkDescriptorSetLayout g_dsl_compute = VK_NULL_HANDLE;  // 2x SSBO (COMPUTE)
 static VkDescriptorSetLayout g_dsl_post1 = VK_NULL_HANDLE;    // 1x sampler (FRAGMENT)
 static VkDescriptorSetLayout g_dsl_post2 = VK_NULL_HANDLE;    // 2x sampler (FRAGMENT)
-static VkDescriptorSet g_ds_mesh = VK_NULL_HANDLE;
+static VkDescriptorSet g_ds_mesh_low = VK_NULL_HANDLE;   // LOW batch list
+static VkDescriptorSet g_ds_mesh_high = VK_NULL_HANDLE;  // HIGH batch list
 static VkDescriptorSet g_ds_compute = VK_NULL_HANDLE;
 static VkDescriptorSet g_ds_bright = VK_NULL_HANDLE;  // samples HDR
 static VkDescriptorSet g_ds_blur_a = VK_NULL_HANDLE;  // samples bright0 -> writes bright1
@@ -179,8 +207,10 @@ static float g_exposure = 1.0f;                        // [ / ] keys, clamped vi
 static float g_bloom_strength = 0.6f;                  // clamped [0,1.5]
 struct PerfCounters {
     double cpu_frame_ms = 0.0;    // real measured host time of render_frame
-    uint64_t draw_calls = 0;      // per frame
-    uint64_t instances = 0;       // instances submitted per instanced draw (N bodies, 2 batches)
+    uint64_t draw_calls = 0;      // per frame (incl. indirect draws)
+    uint64_t indirect_draw_calls = 0; // per frame (GPU-driven subset)
+    uint64_t dispatch_calls = 0;  // per frame (compute)
+    uint64_t instances = 0;       // indirect calls submit GPU-side counts; here: packed instance records
     uint32_t visible_low = 0;     // GPU-mask count (+1 frame lag)
     uint32_t visible_high = 0;    // GPU-mask count (+1 frame lag)
     uint32_t post_passes = 4;     // bright, blurH, blurV, composite (static, documented)
@@ -366,6 +396,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case 'V': g_show_vectors = !g_show_vectors; g_viz_mode = g_show_vectors ? "velocity" : "orbital"; break;
         case 'P': g_show_apsis = !g_show_apsis; break;   // peri/apo tick marks
+        case 'G': g_show_axes = !g_show_axes; break;     // reference-frame axes
+        case 'H': g_hud_enabled = !g_hud_enabled; break; // in-canvas HUD toggle
         case VK_OEM_4: {                         // [ — exposure down (CINEMATIC display param)
             g_exposure = astra::app::clamp_exposure(g_exposure / 1.25f);
             printf("[ASTRA] exposure = x%.3f (CINEMATIC; scientific state unchanged)\n", g_exposure);
@@ -500,6 +532,23 @@ static bool create_device() {
     VK_CHECK(vkCreateDevice(g_gpu, &dci, nullptr, &g_device));
     vkGetDeviceQueue(g_device, g_gfx_family, 0, &g_gfx_queue);
     printf("[ASTRA] Device created (queue family %u)\n", g_gfx_family);
+    // v0.6/Phase 7: REAL device diagnostics (all values from the driver).
+    {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(g_gpu, &p);
+        const char* dtype = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete"
+                          : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                          : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? "virtual"
+                          : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "cpu" : "other";
+        printf("[ASTRA] DIAG Vulkan API: %u.%u.%u (device) / requested 1.3\n",
+               VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion));
+        printf("[ASTRA] DIAG device type: %s | driverVersion=%u | vendorID=0x%04x\n", dtype, p.driverVersion, p.vendorID);
+        printf("[ASTRA] DIAG limits: maxBoundDescriptorSets=%u maxPushConstants=%u maxComputeWorkGroup=[%u,%u,%u] maxSSBOs/VS=%u maxSSBOs/FS=%u max64SSBO=%u\n",
+               p.limits.maxBoundDescriptorSets, p.limits.maxPushConstantsSize,
+               p.limits.maxComputeWorkGroupCount[0], p.limits.maxComputeWorkGroupCount[1], p.limits.maxComputeWorkGroupCount[2],
+               p.limits.maxPerStageDescriptorStorageBuffers, p.limits.maxPerStageDescriptorStorageBuffers, 0u);
+        printf("[ASTRA] DIAG validation layers: none requested (release build; debug layers optional, not fabricated as enabled)\n");
+    }
     return true;
 }
 
@@ -567,6 +616,8 @@ static bool create_swapchain() {
         VK_CHECK(vkCreateImageView(g_device, &vci, nullptr, &g_sc_views[i]));
     }
     printf("[ASTRA] Swapchain created %ux%u (%u images)\n", extent.width, extent.height, img_count);
+    printf("[ASTRA] DIAG swapchain: format=%d colorSpace=%d presentMode=FIFO(msaa=1x, offscreen targets single-sample)\n",
+           (int)fmt.format, (int)fmt.colorSpace);
     return true;
 }
 
@@ -766,12 +817,16 @@ static bool create_offscreen_image(VkExtent2D ext, VkImageUsageFlags usage, Offs
 static bool create_offscreen() {
     if (!create_offscreen_image(g_sc_extent,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_hdr)) return false;
-    if (!create_offscreen_image(g_sc_extent,
+    // v0.6: bloom chain at half resolution (deterministic half_extent policy).
+    const astra::app::Extent2 he = astra::app::half_extent({g_sc_extent.width, g_sc_extent.height});
+    g_bright_extent.width = he.w; g_bright_extent.height = he.h;
+    VkExtent2D be = g_bright_extent;
+    if (!create_offscreen_image(be,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_bright0)) return false;
-    if (!create_offscreen_image(g_sc_extent,
+    if (!create_offscreen_image(be,
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, g_bright1)) return false;
-    printf("[ASTRA] HDR offscreen chain: %ux%u (scene target + bloom ping-pong)\n",
-           g_sc_extent.width, g_sc_extent.height);
+    printf("[ASTRA] HDR offscreen chain: scene %ux%u, bloom %ux%u (half-res, deterministic policy)\n",
+           g_sc_extent.width, g_sc_extent.height, be.width, be.height);
     return true;
 }
 
@@ -790,20 +845,42 @@ static bool create_sampler() {
     return true;
 }
 
-// ─── v0.5: instance SSBO + mask (host-coherent; production-simple) ────────────
+// ─── v0.5/v0.6: GPU instancing + culling + driven buffers (host-coherent) ────
 static bool create_gpu_instancing() {
     const VkDeviceSize inst_bytes = (VkDeviceSize)INSTANCE_CAPACITY * sizeof(astra::app::BodyInstance);
     const VkDeviceSize mask_bytes = (VkDeviceSize)INSTANCE_CAPACITY * sizeof(uint32_t);
+    const VkDeviceSize cmd_bytes = 2 * sizeof(astra::app::IndirectCmd); // == 2 x VkDrawIndexedIndirectCommand
+    const VkDeviceSize hud_bytes = (VkDeviceSize)HUD_VERTEX_CAPACITY * 12; // vec2+xy+colorIdx
     if (!create_upload_buffer(inst_bytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_inst_buf, g_inst_mem)) { ++g_perf.alloc_failures; return false; }
     if (!create_upload_buffer(mask_bytes,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_mask_buf, g_mask_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(inst_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_low_buf, g_low_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(inst_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_high_buf, g_high_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(cmd_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+            g_indirect_buf, g_indirect_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(hud_bytes,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, g_hud_vb, g_hud_vb_mem)) { ++g_perf.alloc_failures; return false; }
     VK_CHECK(vkMapMemory(g_device, g_inst_mem, 0, inst_bytes, 0, &g_inst_mapped));
     VK_CHECK(vkMapMemory(g_device, g_mask_mem, 0, mask_bytes, 0, &g_mask_mapped));
+    VK_CHECK(vkMapMemory(g_device, g_hud_vb_mem, 0, hud_bytes, 0, &g_hud_vb_mapped));
     memset(g_inst_mapped, 0, (size_t)inst_bytes);
     memset(g_mask_mapped, 0, (size_t)mask_bytes);
-    printf("[ASTRA] GPU instancing: %u-slot SSBO (%zu B/record) + LOD/visibility mask\n",
-           INSTANCE_CAPACITY, sizeof(astra::app::BodyInstance));
+    memset(g_hud_vb_mapped, 0, (size_t)hud_bytes);
+    // Indirect commands start as zero-instance draws (safe before first dispatch).
+    {
+        void* p = nullptr;
+        VK_CHECK(vkMapMemory(g_device, g_indirect_mem, 0, cmd_bytes, 0, &p));
+        memset(p, 0, (size_t)cmd_bytes);
+        vkUnmapMemory(g_device, g_indirect_mem);
+    }
+    static_assert(sizeof(astra::app::IndirectCmd) == sizeof(VkDrawIndexedIndirectCommand),
+                  "GPU-driven command layout must match VkDrawIndexedIndirectCommand");
+    printf("[ASTRA] GPU instancing/driven: %u-slot SSBO + mask + 2 batch lists + indirect cmd buf (2x20B) + HUD VB (%u verts)\n",
+           INSTANCE_CAPACITY, HUD_VERTEX_CAPACITY);
     return true;
 }
 
@@ -828,14 +905,13 @@ static bool create_descriptors() {
         li.pBindings = b;
         return vkCreateDescriptorSetLayout(g_device, &li, nullptr, &out) == VK_SUCCESS;
     };
-    VkDescriptorSetLayoutBinding mb[2]{};
+    VkDescriptorSetLayoutBinding mb[1]{};
     mb[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
-    mb[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
-    if (!make_layout(mb, 2, g_dsl_mesh)) return false;
-    VkDescriptorSetLayoutBinding cb[2]{};
-    cb[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    cb[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    if (!make_layout(cb, 2, g_dsl_compute)) return false;
+    if (!make_layout(mb, 1, g_dsl_mesh)) return false;
+    VkDescriptorSetLayoutBinding cb[5]{}; // inst, mask, low, high, commands
+    for (uint32_t b = 0; b < 5; ++b)
+        cb[b] = {b, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    if (!make_layout(cb, 5, g_dsl_compute)) return false;
     VkDescriptorSetLayoutBinding p1[1]{};
     p1[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     if (!make_layout(p1, 1, g_dsl_post1)) return false;
@@ -852,7 +928,8 @@ static bool create_descriptors() {
         ai.pSetLayouts = &l;
         return vkAllocateDescriptorSets(g_device, &ai, &out) == VK_SUCCESS;
     };
-    if (!alloc(g_dsl_mesh, g_ds_mesh)) return false;
+    if (!alloc(g_dsl_mesh, g_ds_mesh_low)) return false;
+    if (!alloc(g_dsl_mesh, g_ds_mesh_high)) return false;
     if (!alloc(g_dsl_compute, g_ds_compute)) return false;
     if (!alloc(g_dsl_post1, g_ds_bright)) return false;
     if (!alloc(g_dsl_post1, g_ds_blur_a)) return false;
@@ -862,12 +939,21 @@ static bool create_descriptors() {
     // Static buffer bindings (SSBOs never change identity).
     VkDescriptorBufferInfo bi{g_inst_buf, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bm{g_mask_buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet w[4]{};
-    w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_mesh, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi, nullptr};
-    w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_mesh, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bm, nullptr};
+    VkDescriptorBufferInfo bl{g_low_buf, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bh{g_high_buf, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bc{g_indirect_buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet w[5]{};
+    w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_mesh_low, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bl, nullptr};
+    w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_mesh_high, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bh, nullptr};
     w[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bi, nullptr};
     w[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bm, nullptr};
-    vkUpdateDescriptorSets(g_device, 4, w, 0, nullptr);
+    w[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bl, nullptr};
+    vkUpdateDescriptorSets(g_device, 5, w, 0, nullptr);
+    // Bindings 3/4 of the compute set (HIGH list + indirect commands).
+    VkWriteDescriptorSet w2[2]{};
+    w2[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bh, nullptr};
+    w2[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bc, nullptr};
+    vkUpdateDescriptorSets(g_device, 2, w2, 0, nullptr);
     return true;
 }
 
@@ -1044,14 +1130,13 @@ static bool create_framebuffers() {
         ci.renderPass = g_pass_post;
         ci.attachmentCount = 1;
         ci.pAttachments = &v;
-        ci.width = g_sc_extent.width;
-        ci.height = g_sc_extent.height;
+        ci.width = g_bright_extent.width;   // bloom targets are half-resolution
+        ci.height = g_bright_extent.height;
         ci.layers = 1;
         return vkCreateFramebuffer(g_device, &ci, nullptr, &out) == VK_SUCCESS;
     };
     if (!post_fb(g_bright0.view, g_fb_bright0)) return false;
     if (!post_fb(g_bright1.view, g_fb_bright1)) return false;
-
     g_framebuffers.resize(g_sc_views.size());
     for (size_t i = 0; i < g_sc_views.size(); i++) {
         VkImageView atts[1] = {g_sc_views[i]};
@@ -1097,7 +1182,8 @@ static bool create_sync() {
 static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* fs, size_t fs_words,
                           VkPrimitiveTopology topo, bool depth_test, bool depth_write,
                           bool with_vertex_input,
-                          VkPipelineLayout layout, VkRenderPass pass, VkPipeline& out) {
+                          VkPipelineLayout layout, VkRenderPass pass, VkPipeline& out,
+                          bool hud_vertex_layout = false) {
     VkShaderModule vm = create_shader_module(std::vector<uint32_t>(vs, vs + vs_words));
     VkShaderModule fm = create_shader_module(std::vector<uint32_t>(fs, fs + fs_words));
     if (!vm || !fm) { printf("[ASTRA] shader module failed\n"); return false; }
@@ -1122,9 +1208,23 @@ static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* f
     attr.format = VK_FORMAT_R32G32B32_SFLOAT;
     attr.offset = 0;
 
+    // v0.6 HUD stroke text: {vec2 xy @0, float colorIdx @1}, 12 B stride.
+    VkVertexInputBindingDescription hbinding{};
+    hbinding.binding = 0;
+    hbinding.stride = 3 * sizeof(float);
+    hbinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription hattr[2]{};
+    hattr[0] = {0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+    hattr[1] = {1, 0, VK_FORMAT_R32_SFLOAT, 2 * sizeof(float)};
+
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    if (with_vertex_input) {
+    if (with_vertex_input && hud_vertex_layout) {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &hbinding;
+        vi.vertexAttributeDescriptionCount = 2;
+        vi.pVertexAttributeDescriptions = hattr;
+    } else if (with_vertex_input) {
         vi.vertexBindingDescriptionCount = 1;
         vi.pVertexBindingDescriptions = &binding;
         vi.vertexAttributeDescriptionCount = 1;
@@ -1218,7 +1318,7 @@ static bool create_pipelines() {
     if (!make_layout(g_dsl_compute, true, g_layout_compute)) return false;
 
     std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f, vector_v,
-                          cull_c, bright_f, blur_f, composite_f;
+                          cull_c, bright_f, blur_f, composite_f, hud_v, hud_f;
     if (!load_shader("astra.vert.spv", astra_v)) return false;
     if (!load_shader("astra.frag.spv", astra_f)) return false;
     if (!load_shader("sphere.vert.spv", sphere_v)) return false;
@@ -1230,6 +1330,8 @@ static bool create_pipelines() {
     if (!load_shader("post_bright.frag.spv", bright_f)) return false;
     if (!load_shader("post_blur.frag.spv", blur_f)) return false;
     if (!load_shader("post_composite.frag.spv", composite_f)) return false;
+    if (!load_shader("hud_text.vert.spv", hud_v)) return false;
+    if (!load_shader("hud_text.frag.spv", hud_f)) return false;
 
     // Scene pipelines (HDR pass).
     if (!make_pipeline(astra_v.data(), astra_v.size(), astra_f.data(), astra_f.size(),
@@ -1254,6 +1356,10 @@ static bool create_pipelines() {
     if (!make_pipeline(astra_v.data(), astra_v.size(), composite_f.data(), composite_f.size(),
                        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
                        g_layout_post2, g_pass_present, g_pipe_composite)) return false;
+    // v0.6: HUD stroke text (LINE_LIST, scene pass, no depth, {vec2,float} layout).
+    if (!make_pipeline(hud_v.data(), hud_v.size(), hud_f.data(), hud_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false, false, true,
+                       g_layout_scene, g_pass_scene, g_pipe_hud, true)) return false;
 
     // Compute culling pipeline (deterministic per-slot mask writes).
     {
@@ -1477,9 +1583,11 @@ void dump_inspector() {
     // (this environment has no GPU; nothing below is fabricated).
     printf("\n[ASTRA] ═══ RENDERER TELEMETRY (v0.5) ═══\n");
     printf("[ASTRA] CPU frame time=%.2f ms (REAL) · GPU frame time=NOT VERIFIED (no timestamps device-side here)\n", g_perf.cpu_frame_ms);
-    printf("[ASTRA] draws/frame=%llu · instanced draws=2 (LOW+HIGH) · instances/draw=%u · visible LOD hi/lo=%u/%u (GPU mask, +1 frame)\n",
-           (unsigned long long)g_perf.draw_calls, (unsigned)std::min(g_bodies.size(), (size_t)INSTANCE_CAPACITY),
-           g_perf.visible_high, g_perf.visible_low);
+    printf("[ASTRA] draws/frame=%llu (incl. indirect=%llu, dispatches=%llu) · GPU-driven path: cull.comp -> 2x vkCmdDrawIndexedIndirect (no CPU list regen)\n",
+           (unsigned long long)g_perf.draw_calls, (unsigned long long)g_perf.indirect_draw_calls,
+           (unsigned long long)g_perf.dispatch_calls);
+    printf("[ASTRA] visible LOD hi/lo=%u/%u (GPU mask, +1 frame readback) · in-canvas HUD=%s (%u verts, authoritative hud_state rows)\n",
+           g_perf.visible_high, g_perf.visible_low, g_hud_enabled ? "ON" : "OFF", g_hud_vertex_count);
     printf("[ASTRA] post chain: HDR(R16G16B16A16F) -> bright(th=1.0) -> blurH/V -> ACES-approx + exp x%.2f -> SRGB swapchain · bloom strength x%.2f\n",
            g_exposure, g_bloom_strength);
     printf("[ASTRA] post passes/frame=%u · swapchain recreations=%llu · alloc failures=%llu · culling mode=GPU compute (deterministic per-slot mask)\n",
@@ -1583,7 +1691,8 @@ static bool render_frame(double fps) {
             inst[i] = astra::app::pack_body_instance(
                 rpos[i][0], rpos[i][1], rpos[i][2], visual_radius_units(g_bodies[i]),
                 g_bodies[i].color[0], g_bodies[i].color[1], g_bodies[i].color[2],
-                (int)i == g_selection);
+                (int)i == g_selection,
+                g_bodies[i].kind == astra::app::BodyKind::STAR);
         }
     }
 
@@ -1597,29 +1706,66 @@ static bool render_frame(double fps) {
         g_perf.visible_low = lo; g_perf.visible_high = hi;
     }
 
-    // ── 1. GPU visibility/LOD classification (deterministic per-slot writes)
+    // ── 0c. Build in-canvas HUD stroke geometry from authoritative HudState ──
+    g_hud_vertex_count = 0;
+    if (g_hud_enabled && g_hud_vb_mapped) {
+        const double fps_val = fps;
+        const auto snap = make_hud_snapshot(fps_val, (fps_val > 1e-6) ? 1000.0 / fps_val : 0.0);
+        const astra::app::HudState hud = astra::app::build_hud(snap);
+        astra::app::HudTextSpec spec{}; // fixed NDC pane (pixel-styled HUD texture by design)
+        std::vector<astra::app::HudSeg> segs;
+        const bool complete = astra::app::build_hud_segments(hud, spec, segs);
+        if (!complete) printf("[ASTRA] HUD text truncated by line budget (deterministic)\n");
+        const size_t verts_needed = segs.size() * 2;
+        if (verts_needed > HUD_VERTEX_CAPACITY) {
+            ++g_perf.alloc_failures; // capacity overflow counted (truthful)
+            printf("[ASTRA] HUD vertex overflow (%zu > %u); skipping frame HUD\n", verts_needed, HUD_VERTEX_CAPACITY);
+        } else {
+            float* vb = (float*)g_hud_vb_mapped;
+            size_t v = 0;
+            for (const auto& s : segs) {
+                vb[v++] = s.x0; vb[v++] = s.y0; vb[v++] = (float)s.color;
+                vb[v++] = s.x1; vb[v++] = s.y1; vb[v++] = (float)s.color;
+            }
+            g_hud_vertex_count = (uint32_t)verts_needed;
+        }
+    }
+
+    // ── 1. GPU-DRIVEN visibility/LOD: classify + deterministic compaction +
+    // indirect command generation (single-workgroup cull.comp) ──
     {
         const uint32_t n = (uint32_t)std::min(n_bodies, (size_t)INSTANCE_CAPACITY);
         struct CullPC { float vp[16]; float params[4]; float eye4[4]; } pc{};
         memcpy(pc.vp, view_proj.m, sizeof(pc.vp));
         pc.params[0] = (float)n;
         pc.params[1] = (float)std::tan((g_camera.fov_deg * 3.141592653589793 / 180.0) * 0.5);
+        pc.params[2] = (float)g_index_count_low;
+        pc.params[3] = (float)g_index_count_high;
         pc.eye4[0] = eye[0]; pc.eye4[1] = eye[1]; pc.eye4[2] = eye[2];
         vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipe_cull);
         vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, g_layout_compute, 0, 1, &g_ds_compute, 0, nullptr);
         vkCmdPushConstants(g_cmd_buf, g_layout_compute, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(g_cmd_buf, (n + 63) / 64, 1, 1);
-        VkBufferMemoryBarrier bb{};
-        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        bb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        bb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bb.buffer = g_mask_buf;
-        bb.offset = 0;
-        bb.size = VK_WHOLE_SIZE;
+        vkCmdDispatch(g_cmd_buf, 1, 1, 1);   // single workgroup (128 lanes), serial order pass
+        ++g_perf.dispatch_calls;
+        // Compute(storage write) -> vertex shader storage reads + draw-indirect args.
+        VkBufferMemoryBarrier bb[4]{};
+        for (int k = 0; k < 4; ++k) {
+            bb[k].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bb[k].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bb[k].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb[k].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb[k].offset = 0;
+            bb[k].size = VK_WHOLE_SIZE;
+            bb[k].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        }
+        bb[0].buffer = g_mask_buf;
+        bb[1].buffer = g_low_buf;
+        bb[2].buffer = g_high_buf;
+        bb[3].buffer = g_indirect_buf;
+        bb[3].dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
         vkCmdPipelineBarrier(g_cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 0, nullptr, 1, &bb, 0, nullptr);
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                             0, 0, nullptr, 4, bb, 0, nullptr);
     }
 
     // ── 2. Scene pass into the HDR target (16-bit float, capability-verified)
@@ -1651,31 +1797,30 @@ static bool render_frame(double fps) {
         vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
         ++g_perf.draw_calls;
 
-        // 2b. Instanced bodies — TWO draws (LOW then HIGH LOD batch). Selection
-        // highlight indexes the single authoritative identity (g_selection).
+        // 2b. Instanced bodies — GPU-DRIVEN indirect draws (LOW, HIGH batch).
+        // Instance counts come ONLY from GPU-written commands (zero CPU list
+        // re-generation after culling). Selection highlight rides in the
+        // packed instance flag (single authoritative identity, RenderState).
         struct InstPC { float vp[16]; float sunPosEmis[4]; float misc[4]; } ipc{};
         memcpy(ipc.vp, view_proj.m, sizeof(ipc.vp));
         ipc.sunPosEmis[0] = rpos[0][0]; ipc.sunPosEmis[1] = rpos[0][1]; ipc.sunPosEmis[2] = rpos[0][2];
         ipc.sunPosEmis[3] = 1.0f;
-        ipc.misc[0] = (float)g_selection;
         vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_mesh);
-        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_mesh, 0, 1, &g_ds_mesh, 0, nullptr);
         VkDeviceSize zero = 0;
         const uint32_t n_inst = (uint32_t)std::min(n_bodies, (size_t)INSTANCE_CAPACITY);
-        // LOW batch (icosphere subdivision 1)
-        ipc.misc[1] = 1.0f;
         vkCmdPushConstants(g_cmd_buf, g_layout_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ipc), &ipc);
+        // LOW batch (icosphere subdivision 1) — indirect cmd at offset 0.
+        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_mesh, 0, 1, &g_ds_mesh_low, 0, nullptr);
         vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_vb_low, &zero);
         vkCmdBindIndexBuffer(g_cmd_buf, g_ib_low, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexed(g_cmd_buf, g_index_count_low, n_inst, 0, 0, 0);
-        ++g_perf.draw_calls; g_perf.instances += n_inst;
-        // HIGH batch (icosphere subdivision 2)
-        ipc.misc[1] = 2.0f;
-        vkCmdPushConstants(g_cmd_buf, g_layout_mesh, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ipc), &ipc);
+        vkCmdDrawIndexedIndirect(g_cmd_buf, g_indirect_buf, 0, 1, sizeof(astra::app::IndirectCmd));
+        ++g_perf.draw_calls; ++g_perf.indirect_draw_calls; g_perf.instances += n_inst;
+        // HIGH batch (icosphere subdivision 2) — indirect cmd at offset 20.
+        vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_mesh, 0, 1, &g_ds_mesh_high, 0, nullptr);
         vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_vb_high, &zero);
         vkCmdBindIndexBuffer(g_cmd_buf, g_ib_high, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexed(g_cmd_buf, g_index_count_high, n_inst, 0, 0, 0);
-        ++g_perf.draw_calls; g_perf.instances += n_inst;
+        vkCmdDrawIndexedIndirect(g_cmd_buf, g_indirect_buf, (VkDeviceSize)sizeof(astra::app::IndirectCmd), 1, sizeof(astra::app::IndirectCmd));
+        ++g_perf.draw_calls; ++g_perf.indirect_draw_calls; g_perf.instances += n_inst;
 
         // 2c. Orbit overlays (Kepler evaluated in-shader from real elements)
         if (n_bodies > 1) {
@@ -1755,10 +1900,69 @@ static bool render_frame(double fps) {
                 }
             }
         }
+        // 2f. Reference-frame axes + selected-object marker (G toggle; marker
+        // tied to the single authoritative selection id — RenderState only).
+        if (g_show_axes || g_selection >= 0) {
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_vector);
+            struct VectorPC { astra::app::Mat4 viewProj; float originScale[4]; float velocity[4]; float color[4]; };
+            if (g_show_axes) {
+                float org[3] = {0.0f, 0.0f, 0.0f}; // floating origin: camera target
+                astra::app::Seg3 ax[3];
+                astra::app::make_axes_segments(org, 50.0f, ax);
+                const float ax_col[3][3] = {{0.9f, 0.25f, 0.25f}, {0.25f, 0.85f, 0.35f}, {0.3f, 0.45f, 0.95f}};
+                for (int a = 0; a < 3; ++a) {
+                    VectorPC pc{};
+                    pc.viewProj = view_proj;
+                    pc.originScale[0] = ax[a].x0; pc.originScale[1] = ax[a].y0; pc.originScale[2] = ax[a].z0;
+                    const float dx = ax[a].x1 - ax[a].x0, dy = ax[a].y1 - ax[a].y0, dz = ax[a].z1 - ax[a].z0;
+                    pc.originScale[3] = std::sqrt(dx*dx + dy*dy + dz*dz); // length via scale path
+                    const float L = pc.originScale[3] > 1e-6f ? pc.originScale[3] : 1.0f;
+                    pc.velocity[0] = dx / L; pc.velocity[1] = dy / L; pc.velocity[2] = dz / L; pc.velocity[3] = 0.0f;
+                    pc.color[0] = ax_col[a][0]; pc.color[1] = ax_col[a][1]; pc.color[2] = ax_col[a][2]; pc.color[3] = 1.0f;
+                    vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                       0, sizeof(pc), &pc);
+                    vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+                    ++g_perf.draw_calls;
+                }
+            }
+            if (g_selection >= 0 && g_selection < (int)n_bodies) {
+                const float span = visual_radius_units(g_bodies[(size_t)g_selection]) * 1.6f + 0.5f;
+                float ctr[3] = {rpos[(size_t)g_selection][0], rpos[(size_t)g_selection][1], rpos[(size_t)g_selection][2]};
+                astra::app::Seg3 mk[2];
+                astra::app::make_selection_marker(ctr, span, mk);
+                for (int s = 0; s < 2; ++s) {
+                    VectorPC pc{};
+                    pc.viewProj = view_proj;
+                    pc.originScale[0] = mk[s].x0; pc.originScale[1] = mk[s].y0; pc.originScale[2] = mk[s].z0;
+                    const float dx = mk[s].x1 - mk[s].x0, dy = mk[s].y1 - mk[s].y0, dz = mk[s].z1 - mk[s].z0;
+                    const float L = std::sqrt(dx*dx + dy*dy + dz*dz);
+                    pc.originScale[3] = L > 1e-6f ? L : 1.0f;
+                    pc.velocity[0] = dx / pc.originScale[3]; pc.velocity[1] = dy / pc.originScale[3]; pc.velocity[2] = dz / pc.originScale[3]; pc.velocity[3] = 0.0f;
+                    pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+                    vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                       0, sizeof(pc), &pc);
+                    vkCmdDraw(g_cmd_buf, 2, 1, 0, 0);
+                    ++g_perf.draw_calls;
+                }
+            }
+        }
+
+        // 2g. ── IN-CANVAS HUD (v0.6): stroke text from authoritative HudState ──
+        if (g_hud_enabled && g_hud_vb_mapped && g_hud_vertex_count > 0) {
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_hud);
+            VkDeviceSize hz = 0;
+            vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_hud_vb, &hz);
+            const float hud_pc[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+            vkCmdPushConstants(g_cmd_buf, g_layout_scene, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, 16, hud_pc);
+            vkCmdDraw(g_cmd_buf, g_hud_vertex_count, 1, 0, 0);
+            ++g_perf.draw_calls;
+        }
+
         vkCmdEndRenderPass(g_cmd_buf);
     }
 
-    // ── 3. Bright pass: HDR -> bright0 ──
+    // ── 3. Bright pass: HDR (full-res) -> bright0 (half-res, downsampled) ──
     const auto fullscreen_post = [&](VkPipeline pipe, VkPipelineLayout layout,
                                      VkDescriptorSet ds, VkFramebuffer fb, const float pc_data[4]) {
         VkRenderPassBeginInfo rp{};
@@ -1766,13 +1970,13 @@ static bool render_frame(double fps) {
         rp.renderPass = g_pass_post;
         rp.framebuffer = fb;
         rp.renderArea.offset = {0, 0};
-        rp.renderArea.extent = g_sc_extent;
+        rp.renderArea.extent = g_bright_extent;
         rp.clearValueCount = 0;
         rp.pClearValues = nullptr;
         vkCmdBeginRenderPass(g_cmd_buf, &rp, VK_SUBPASS_CONTENTS_INLINE);
-        VkViewport viewport{0.0f, 0.0f, (float)g_sc_extent.width, (float)g_sc_extent.height, 0.0f, 1.0f};
+        VkViewport viewport{0.0f, 0.0f, (float)g_bright_extent.width, (float)g_bright_extent.height, 0.0f, 1.0f};
         vkCmdSetViewport(g_cmd_buf, 0, 1, &viewport);
-        VkRect2D scissor{{0, 0}, g_sc_extent};
+        VkRect2D scissor{{0, 0}, g_bright_extent};
         vkCmdSetScissor(g_cmd_buf, 0, 1, &scissor);
         vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &ds, 0, nullptr);
@@ -1785,14 +1989,14 @@ static bool render_frame(double fps) {
         const float bright_pc[4] = {astra::app::bloom_threshold(), 0.5f, 0, 0};
         fullscreen_post(g_pipe_bright, g_layout_post1, g_ds_bright, g_fb_bright0, bright_pc);
     }
-    // ── 4. Blur H: bright0 -> bright1 ──
+    // ── 4. Blur H (half-res): bright0 -> bright1 ──
     {
-        const float dir[4] = {1.0f / (float)g_sc_extent.width, 0.0f, 0, 0};
+        const float dir[4] = {1.0f / (float)g_bright_extent.width, 0.0f, 0, 0};
         fullscreen_post(g_pipe_blur, g_layout_post1, g_ds_blur_a, g_fb_bright1, dir);
     }
-    // ── 5. Blur V: bright1 -> bright0 ──
+    // ── 5. Blur V (half-res): bright1 -> bright0 ──
     {
-        const float dir[4] = {0.0f, 1.0f / (float)g_sc_extent.height, 0, 0};
+        const float dir[4] = {0.0f, 1.0f / (float)g_bright_extent.height, 0, 0};
         fullscreen_post(g_pipe_blur, g_layout_post1, g_ds_blur_b, g_fb_bright0, dir);
     }
     // ── 6. Composite: HDR + bloom -> swapchain (ACES-approx + exposure) ──
@@ -1872,10 +2076,20 @@ static void cleanup() {
     if (g_layout_compute) vkDestroyPipelineLayout(g_device, g_layout_compute, nullptr);
     if (g_inst_mapped) vkUnmapMemory(g_device, g_inst_mem);
     if (g_mask_mapped) vkUnmapMemory(g_device, g_mask_mem);
+    if (g_hud_vb_mapped) vkUnmapMemory(g_device, g_hud_vb_mem);
     if (g_inst_buf) vkDestroyBuffer(g_device, g_inst_buf, nullptr);
     if (g_mask_buf) vkDestroyBuffer(g_device, g_mask_buf, nullptr);
+    if (g_low_buf) vkDestroyBuffer(g_device, g_low_buf, nullptr);
+    if (g_high_buf) vkDestroyBuffer(g_device, g_high_buf, nullptr);
+    if (g_indirect_buf) vkDestroyBuffer(g_device, g_indirect_buf, nullptr);
+    if (g_hud_vb) vkDestroyBuffer(g_device, g_hud_vb, nullptr);
     if (g_inst_mem) vkFreeMemory(g_device, g_inst_mem, nullptr);
     if (g_mask_mem) vkFreeMemory(g_device, g_mask_mem, nullptr);
+    if (g_low_mem) vkFreeMemory(g_device, g_low_mem, nullptr);
+    if (g_high_mem) vkFreeMemory(g_device, g_high_mem, nullptr);
+    if (g_indirect_mem) vkFreeMemory(g_device, g_indirect_mem, nullptr);
+    if (g_hud_vb_mem) vkFreeMemory(g_device, g_hud_vb_mem, nullptr);
+    if (g_pipe_hud) vkDestroyPipeline(g_device, g_pipe_hud, nullptr);
     if (g_vb_low) vkDestroyBuffer(g_device, g_vb_low, nullptr);
     if (g_vb_high) vkDestroyBuffer(g_device, g_vb_high, nullptr);
     if (g_ib_low) vkDestroyBuffer(g_device, g_ib_low, nullptr);
@@ -1913,7 +2127,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     freopen("CONOUT$", "w", stderr);
-    printf("[ASTRA] ASTRA COSMOS v0.5 — REAL RENDERING: HDR16F pipeline, bloom, instanced LOD bodies, GPU culling, ACES-approx composite\n");
+    printf("[ASTRA] ASTRA COSMOS v0.6 — GPU-DRIVEN indirect draws, in-canvas HUD text, half-res bloom, overlay hardening\n");
 
     // Scientific scenario (Python engine remains the authority; this native
     // mirror reproduces astra.orbital exactly — see app/celestial_sim.h).
@@ -1963,7 +2177,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     update_post_descriptors();
     if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    printf("[ASTRA] v0.5 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | [ ] exposure | F1 HUD+inspector | ESC quit\n");
+    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F1 inspector | ESC quit\n");
     dump_inspector();
 
     auto t_prev = std::chrono::high_resolution_clock::now();

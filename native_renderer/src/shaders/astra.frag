@@ -1,8 +1,11 @@
 #version 450
 // ASTRA COSMOS — background pass: deep-space gradient + deterministic starfield.
 // Hash matches the project's deterministic convention (common.glsl 43758.5453,
-// seed policy 0xA573). Stars here are CINEMATIC background sky (not catalog
-// data); catalog/data-derived objects are rendered as simulated bodies.
+// seed policy 0xA573). Stars here are PROCEDURAL/CINEMATIC background sky —
+// NOT catalog data: no real star catalog (Gaia/Hipparcos/HYG/BSC5) exists in
+// this repository and the build environment has no network access, so a real
+// catalog cannot be ingested here; see ASTRA_V0_6_REPORT.md (missing-data
+// dependency documented, not fabricated).
 
 layout(location = 0) in vec2 inUV;
 layout(location = 0) out vec4 outColor;

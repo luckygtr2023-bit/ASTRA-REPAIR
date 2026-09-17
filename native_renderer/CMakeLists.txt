@@ -249,6 +249,9 @@ if(GLSLANG_VALIDATOR)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/post_bright.frag"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/post_blur.frag"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/post_composite.frag"
+        # v0.6 additions (in-canvas HUD text; GPU-driven indirect path).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/hud_text.vert"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/hud_text.frag"
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})

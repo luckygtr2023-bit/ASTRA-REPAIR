@@ -60,12 +60,51 @@ HdrFormatChoice choose_hdr_format(bool r16_ok_render, bool r16_ok_sample) {
 }
 
 BodyInstance pack_body_instance(float rx, float ry, float rz, float radius,
-                                float cr, float cg, float cb, bool selected) {
+                                float cr, float cg, float cb, bool selected,
+                                bool emissive) {
     BodyInstance bi{};
     bi.pos_radius[0] = rx; bi.pos_radius[1] = ry; bi.pos_radius[2] = rz; bi.pos_radius[3] = radius;
     bi.color_flag[0] = cr; bi.color_flag[1] = cg; bi.color_flag[2] = cb;
-    bi.color_flag[3] = selected ? 1.0f : 0.0f;
+    bi.color_flag[3] = (selected ? 1.0f : 0.0f) + (emissive ? 2.0f : 0.0f);
     return bi;
+}
+
+// ── v0.6 additions ────────────────────────────────────────────────────────────
+
+Extent2 half_extent(Extent2 e) {
+    Extent2 h{e.w / 2, e.h / 2};
+    if (h.w < 1u) h.w = 1u;
+    if (h.h < 1u) h.h = 1u;
+    return h;
+}
+
+bool compact_lod(const uint8_t* lod, uint32_t n, CompactResult& out) {
+    out = CompactResult{};
+    if (!lod || n > 128u) return false;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (lod[i] == 1u) out.low_order[out.low_count++] = i;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (lod[i] == 2u) out.high_order[out.high_count++] = i;
+    }
+    return true;
+}
+
+void build_indirect_commands(const CompactResult& r, uint32_t low_idx_count, uint32_t high_idx_count,
+                             IndirectCmd& out_low, IndirectCmd& out_high) {
+    out_low = {low_idx_count, r.low_count, 0u, 0, 0u};
+    out_high = {high_idx_count, r.high_count, 0u, 0, 0u};
+}
+
+void make_axes_segments(float origin[3], float L, Seg3 out3[3]) {
+    out3[0] = {origin[0], origin[1], origin[2], origin[0] + L, origin[1], origin[2]};
+    out3[1] = {origin[0], origin[1], origin[2], origin[0], origin[1] + L, origin[2]};
+    out3[2] = {origin[0], origin[1], origin[2], origin[0], origin[1], origin[2] + L};
+}
+
+void make_selection_marker(float center[3], float half_span, Seg3 out2[2]) {
+    out2[0] = {center[0] - half_span, center[1], center[2], center[0] + half_span, center[1], center[2]};
+    out2[1] = {center[0], center[1] - half_span, center[2], center[0], center[1] + half_span, center[2]};
 }
 
 } // namespace astra::app

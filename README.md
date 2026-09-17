@@ -205,7 +205,8 @@ elements, procedural starfield background, floating-origin camera.
   `W A S D Q E` = FREE-camera move (SHIFT/PgUp fast, PgDn slow) · `+` / `-` = warp ×2/÷2 · `0`–`8` = warp presets (1×…1e8×) ·
   Space = pause · `.` = sim step · Backspace = epoch reset (J2000) · F5 = scenario restart · **F2 = save scenario, F3 = load scenario** (path-safe,
   `<exe>/saves/scenario_1.json`) · V = velocity-vector overlay · `P` = peri/apo apsis markers · Home = reset view ·
-  **`[` / `]` = HD exposure down/up (CINEMATIC display param)** · F1 = scientific HUD matrix + inspector · ESC = quit.
+  **`[` / `]` = HD exposure down/up (CINEMATIC display param)** · `G` = reference-frame axes · `H` = in-canvas HUD ·
+  F1 = scientific HUD matrix + inspector · ESC = quit.
   (Reverse time is intentionally not offered: the mirrored scientific authority does not define it.)
 - **v0.4 additions**: scientific HUD data model with explicit `NOT AVAILABLE` rows (title bar + F1 matrix; on-canvas
   text planned); selection decoupled from camera target with one authoritative `selected_id`; star color consumed from
@@ -219,6 +220,13 @@ elements, procedural starfield background, floating-origin camera.
   visibility/LOD classification (deterministic per-slot mask; CPU policy twin under 2984-check gates); renderer
   telemetry (real CPU timings, draw/instance/LOD counts) in the title bar and F1. GPU/Windows runtime: NOT VERIFIED
   in this environment — statuses are precisely labeled.
+- **v0.6 stabilization (see `ASTRA_V0_6_REPORT.md`)**: full GPU-driven path — deterministic compute compaction into
+  LOW/HIGH instance lists with **real `vkCmdDrawIndexedIndirect` (no CPU list regeneration)**; **in-canvas HUD** —
+  stroke text rendered inside the HDR pass from the same authoritative `hud_state` rows as the console/title HUD
+  (self-authored 5×8 stroke font, `H` toggles); half-resolution bloom chain (deterministic `half_extent` policy);
+  reference-frame axes (`G`) and a selected-object crosshair bound to the single authoritative selection identity;
+  startup device diagnostics (real API version/device type/driver limits). Real star catalog: **not available in
+  repo and no network in this environment** — procedural starfield remains, explicitly labeled (no fabricated data).
 - **Inspector**: the title bar always shows focus body, true SI heliocentric distance (AU),
   vis-viva speed (km/s), epoch (J2000 + years), warp, and the classification tag
   (`SIMULATED (Kepler, JPL approx. elements)`). CINEMATIC visual scaling (sublinear
