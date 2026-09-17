@@ -1,0 +1,93 @@
+# ─── ASTRA COSMOS — source tree hygiene ───────────────────────────────────────
+# Rule: only source, docs, tests and small text assets are tracked.
+# Build outputs, local environments, credentials and logs never enter git.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+coverage/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.pyre/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Secrets / local configuration (.env.example stays tracked)
+.env
+.env.*
+!.env.example
+
+# Credentials that must never be committed
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Native renderer build trees (any build* directory under native_renderer)
+native_renderer/build*/
+native_renderer/out/
+# CMake / MSVC / Ninja residue anywhere
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.vcxproj.user
+*.tlog
+*.obj
+*.idb
+*.pdb
+*.ilk
+*.recipe
+*.lastbuildstate
+ipch/
+
+# Compiled binaries (checked-in runtimes are published via releases, not git)
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+# Compiled shaders are a build product of glslangValidator
+*.spv
+
+# Exception: the release staging tree is a tracked fixture —
+# scripts/tests/test_windows_bootstrap.py asserts its runtime layout.
+!release/ASTRA-COSMOS/bin/astra_native
+!release/ASTRA-COSMOS/bin/libastra_renderer.a
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Runtime logs and local caches (logs/.gitkeep stays tracked)
+*.log
+logs/*
+!logs/.gitkeep
+.cache/
+
+# Large local archives — source of truth is git, not zips
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tar.xz
+*.tar.bz2
+
+# Distribution / bootstrap build outputs (policy tests stay tracked)
+bootstrap/src/bin/
+bootstrap/src/obj/
+!/distribution/tests/
+!/distribution/tests/*.py
