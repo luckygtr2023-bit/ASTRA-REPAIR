@@ -1,3 +1,26 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.8)
+
+## 0. v0.8 increment — native N-body engine (roadmap #13 partial: N-body)
+
+Full report: `ASTRA_V0_8_REPORT.md`. Physics CPU-VERIFIED via cross-language
+fidelity gate vs the Python authority `astra.nbody`: nbody mirror 43 checks
+PASS, worst rel err 4.606e-13 over 180 sim-days, 1-yr engine energy drift
+-2.9e-13, Verlet 2nd-order convergence ratio measured = 4.00 (root-caused
+metric fix: barycentric momentum floor 2π·m/(M+m) masqueraded as phase error;
+code was right, metric was conflated — assert NOT weakened, metric corrected).
+Binding: `GravityModel{KEPLER(default, unchanged),NBODY}` opt-in via persist
+`gravity_model` field (pre-v0.8 saves compatible, tamper rejects), HUD
+`GRAVITY` row with policy disclosure, production wiring via
+`gravity_refresh_world()` (forward-time contract, explicit re-anchor, no
+silent model swap). Statuses: SOURCE/STATIC/BUILD VERIFIED; WINDOWS/GPU/
+RUNTIME(app)/VISUAL/PERFORMANCE NOT VERIFIED (environment unchanged).
+
+Battery this phase (all green): v04 PASS · v05 2984 · v06 645 · kepler 99 ·
+nbody mirror 43 · v07 109 (NEW) · pytest 1535 · shaders 19/0 + 13/13 SPV ·
+native build PASS (nbody_sim.o linked) · main syntax 0 errors vs Vulkan 1.4.362.
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v0.7a)
 
 ## 0. v0.7a environment gate outcome

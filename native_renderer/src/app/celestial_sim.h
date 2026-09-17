@@ -24,6 +24,8 @@
 #include <string>
 #include <vector>
 
+#include "nbody_sim.h"
+
 namespace astra::app {
 
 // ---- Units (authoritative, SI-derived) --------------------------------------
@@ -91,6 +93,57 @@ std::vector<CelestialBody> make_solar_system();
 std::vector<Vec3d> propagate_world(const std::vector<CelestialBody>& bodies, double t_s);
 // Same for velocities (heliocentric km/s; moons add parent velocity).
 std::vector<Vec3d> propagate_world_velocity(const std::vector<CelestialBody>& bodies, double t_s);
+
+// ---- Gravity model selection (v0.8) -----------------------------------------
+// KEPLER (default): exact two-body ephemeris (fast, stateless, backwards-safe).
+// NBODY: full gravitational N-body via the native mirror of astra.nbody —
+// SIMULATED (Newtonian point masses, Plummer-softened, velocity Verlet,
+// dt fixed at NBODY_DT_S). Stateful: forward-time only from the seed epoch;
+// `reset` reseeds. Classification everywhere it surfaces: "SIMULATED N-body
+// (Newtonian · velocity Verlet · dt=3600 s)".
+enum class GravityModel { KEPLER, NBODY };
+const char* gravity_model_name(GravityModel m);
+// Fixed policy step. 3600 s keeps velocity-Verlet (2nd order) energy error
+// tiny for solar-system timescales while staying cheap (see v07 gates +
+// nbody_mirror_check for the measured drift).
+inline constexpr double NBODY_DT_S = 3600.0;
+
+// Build the SI (metres/m/s) heliocentric-frame NBody initial state from the
+// body table time t_s (masses from CelestialBody::mass_kg — DATA-DERIVED).
+// Order preserved; every body (incl. Moon) becomes a free body in the
+// heliocentric frame. Seeding states come from the Kepler ephemeris, so the
+// NBODY system is initialised from the SAME scientific truth the KEPLER model
+// renders; gravity then evolves it (this is the documented transition).
+std::vector<NBody> to_nbody_state(const std::vector<CelestialBody>& bodies, double t_s);
+
+// Stateful adapter owning one integrated system. NOT thread-safe; owned by the
+// sim thread only. G = G_SI, softening = DEFAULT_SOFTENING_M (authority defaults).
+class NBodyEngine {
+public:
+    // Seed from celestial bodies at epoch t0_s (production seeds at J2000, 0.0).
+    void seed(const std::vector<CelestialBody>& bodies, double t0_s);
+    void reset() { seeded_ = false; bodies_.clear(); t_cur_s_ = 0.0; e0_j_ = 0.0; }
+    bool seeded() const { return seeded_; }
+    double time_s() const { return t_cur_s_; }
+    // Advance forward to t_s. Returns false if t_s < t_cur_s_ (time travel
+    // backwards through an integrated history is NOT silently faked — reset
+    // and reseed instead). Final sub-step lands exactly on t_s.
+    bool advance_to(double t_s);
+    const std::vector<NBody>& bodies() const { return bodies_; }
+    // World state converted back to the app's units (heliocentric km / km/s).
+    std::vector<Vec3d> world_km() const;
+    std::vector<Vec3d> velocity_km_s() const;
+    // Diagnostics (SIMULATED measurement of the engine itself): initial and
+    // current total energy (J); relative drift vs seed (0 when unseeded).
+    double initial_energy_j() const { return e0_j_; }
+    double energy_drift_rel() const;
+private:
+    std::vector<NBody> bodies_;
+    std::vector<Vec3m> acc_cache_;
+    double t_cur_s_ = 0.0;
+    double e0_j_ = 0.0;
+    bool seeded_ = false;
+};
 
 // ---- Simulation clock (sim seconds, explicit warp, pausable) ----------------
 struct SimClock {

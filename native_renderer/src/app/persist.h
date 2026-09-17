@@ -24,6 +24,10 @@ struct ScenarioSave {
     float free_pos[3] = {0, 0, 0};
     bool show_vectors = true;
     std::string viz_mode = "orbital";
+    // v0.8: gravity model selection ("kepler" | "nbody"). OPTIONAL on load —
+    // pre-v0.8 files (15 keys) parse with the "kepler" default; unknown values
+    // fail the load like any tamper.
+    std::string gravity_model = "kepler";
     int save_version = VERSION;
 };
 

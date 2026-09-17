@@ -61,6 +61,8 @@ static std::vector<astra::app::CelestialBody> g_bodies;
 static std::vector<astra::app::Vec3d> g_world;
 static std::vector<astra::app::Vec3d> g_vel; // heliocentric km/s (authoritative mirror)
 static astra::app::SimClock g_clock;
+static astra::app::NBodyEngine g_nbody;  // v0.8: used only when g_gravity==NBODY
+static astra::app::GravityModel g_gravity = astra::app::GravityModel::KEPLER;
 static astra::app::OrbitCamera g_camera;
 static int g_focus = 3;                     // Earth
 static const double POS_SCALE = 100.0 / astra::app::AU_KM; // km -> render units
@@ -348,11 +350,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_audio.push(astra::app::AudioEventKind::SIM_WARP, "clock", g_clock.sim_time_s);
             break;
         case VK_OEM_PERIOD: g_step_once = true; g_audio.push(astra::app::AudioEventKind::SIM_STEP, "clock", g_clock.sim_time_s); break;
-        case VK_BACK:    g_clock.sim_time_s = 0.0; g_audio.push(astra::app::AudioEventKind::SIM_RESET, "clock", g_clock.sim_time_s); break;
-        case VK_F5:      g_clock.sim_time_s = 0.0; g_clock.paused = false; g_audio.push(astra::app::AudioEventKind::SIM_RESTART, "clock", g_clock.sim_time_s); break;
+        case VK_BACK:    g_clock.sim_time_s = 0.0; g_nbody.reset(); g_audio.push(astra::app::AudioEventKind::SIM_RESET, "clock", g_clock.sim_time_s); break;
+        case VK_F5:      g_clock.sim_time_s = 0.0; g_clock.paused = false; g_nbody.reset(); g_audio.push(astra::app::AudioEventKind::SIM_RESTART, "clock", g_clock.sim_time_s); break;
         case VK_F2: {    // F2 save scenario (persistence; traversal-safe names)
             astra::app::ScenarioSave s{};
-            s.sim_time_s = g_clock.sim_time_s; s.warp = g_clock.warp; s.paused = g_clock.paused;
+            s.sim_time_s = g_clock.sim_time_s; s.warp = g_clock.warp; s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler"; s.paused = g_clock.paused;
+            s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler";
             s.focus = g_focus; s.selection = g_selection;
             s.cam_mode = (g_cam_mode == CamMode::FREE) ? 1 : 0;
             s.cam_azimuth = g_camera.azimuth; s.cam_elevation = g_camera.elevation; s.cam_distance = g_camera.distance;
@@ -370,7 +373,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_F3: {    // F3 load scenario (strict parse: no silent state discard)
             astra::app::ScenarioSave s{};
             if (astra::app::load_scenario_file(exe_dir() + "\\saves", "scenario_1.json", s)) {
-                g_clock.sim_time_s = s.sim_time_s; g_clock.warp = s.warp; g_clock.paused = s.paused;
+                g_clock.sim_time_s = s.sim_time_s; g_clock.warp = s.warp; g_clock.paused = s.paused; g_gravity = (s.gravity_model == "nbody")
+                           ? astra::app::GravityModel::NBODY
+                           : astra::app::GravityModel::KEPLER;
+                g_nbody.reset();
                 g_focus = std::clamp(s.focus, 0, (int)g_bodies.size() - 1);
                 g_selection = (s.selection >= 0 && s.selection < (int)g_bodies.size()) ? s.selection : -1;
                 g_cam_mode = (s.cam_mode == 1) ? CamMode::FREE : CamMode::FOLLOW;
@@ -1428,6 +1434,31 @@ static double VisualVectorScale(double vmag_km_s) {
     return 4.0 + 0.12 * vmag_km_s;
 }
 
+// v0.8: gravity-model dispatch. KEPLER = exact two-body ephemeris (default).
+// NBODY = integrated astra.nbody mirror. Backward time through an integrated
+// history is NEVER silently faked: the engine re-anchors from the Kepler
+// ephemeris at the current sim time, loudly. On failure the previous world
+// state is kept (no silent mid-mode swap to a different physics model).
+static void gravity_refresh_world() {
+    if (g_gravity == astra::app::GravityModel::NBODY) {
+        if (!g_nbody.seeded() || g_clock.sim_time_s < g_nbody.time_s()) {
+            g_nbody.seed(g_bodies, g_clock.sim_time_s);
+            printf("[ASTRA] NBODY anchored at t=%.2f s (SIMULATED N-body)\n",
+                   g_clock.sim_time_s);
+        }
+        if (g_nbody.advance_to(g_clock.sim_time_s)) {
+            g_world = g_nbody.world_km();
+            g_vel = g_nbody.velocity_km_s();
+            return;
+        }
+        printf("[ASTRA] NBODY advance FAILED at t=%.2f s — keeping previous state\n",
+               g_clock.sim_time_s);
+        return;
+    }
+    g_world = astra::app::propagate_world(g_bodies, g_clock.sim_time_s);
+    g_vel = astra::app::propagate_world_velocity(g_bodies, g_clock.sim_time_s);
+}
+
 static void sim_tick(double real_dt_s) {
     if (g_step_once) {
         // Single simulation step: one wall-frame worth of warped sim time.
@@ -1437,8 +1468,7 @@ static void sim_tick(double real_dt_s) {
     } else {
         g_clock.advance(real_dt_s);
     }
-    g_world = astra::app::propagate_world(g_bodies, g_clock.sim_time_s);
-    g_vel = astra::app::propagate_world_velocity(g_bodies, g_clock.sim_time_s);
+    gravity_refresh_world();
 
     // Keep the ASTRA RenderState binding truthful (double authority).
     g_scene.state.sim_time_s = g_clock.sim_time_s;
@@ -1521,7 +1551,7 @@ static void update_camera_from_input(double real_dt_s) {
 static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
     astra::app::HudSnapshot s{};
     s.sim_time_s = g_clock.sim_time_s;
-    s.warp = g_clock.warp;
+    s.warp = g_clock.warp; s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler";
     s.paused = g_clock.paused;
     s.fps = fps;
     s.frame_ms = frame_ms;
@@ -2189,8 +2219,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     // Scientific scenario (Python engine remains the authority; this native
     // mirror reproduces astra.orbital exactly — see app/celestial_sim.h).
     g_bodies = astra::app::make_solar_system();
-    g_world = astra::app::propagate_world(g_bodies, g_clock.sim_time_s);
-    g_vel = astra::app::propagate_world_velocity(g_bodies, g_clock.sim_time_s);
+    gravity_refresh_world();
     // Phase R: consume the project star-temperature LUT for the star's visual
     // color (blackbody-approx 2000..40kK, provenance: generate_lut.py, CC0).
     {

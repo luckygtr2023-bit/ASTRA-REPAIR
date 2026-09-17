@@ -26,12 +26,13 @@ std::string serialize_scenario(const ScenarioSave& s) {
         "free_pos_z=%.9e\n"
         "show_vectors=%d\n"
         "viz_mode=%s\n"
+        "gravity_model=%s\n"
         "END\n",
         s.save_version, s.sim_time_s, s.warp, s.paused ? 1 : 0,
         s.focus, s.selection, s.cam_mode,
         s.cam_azimuth, s.cam_elevation, s.cam_distance,
         (double)s.free_pos[0], (double)s.free_pos[1], (double)s.free_pos[2],
-        s.show_vectors ? 1 : 0, s.viz_mode.c_str());
+        s.show_vectors ? 1 : 0, s.viz_mode.c_str(), s.gravity_model.c_str());
     return buf;
 }
 
@@ -66,12 +67,18 @@ bool deserialize_scenario(const std::string& text, ScenarioSave& out) {
             else if (key == "free_pos_z") { tmp.free_pos[2] = (float)std::stod(val); seen[12] = true; }
             else if (key == "show_vectors") { tmp.show_vectors = std::stoi(val) != 0; seen[13] = true; }
             else if (key == "viz_mode") { tmp.viz_mode = val; seen[14] = true; }
+            else if (key == "gravity_model") {  // v0.8 optional extension
+                if (val != "kepler" && val != "nbody") return false;
+                tmp.gravity_model = val;
+                seen[15] = true;
+            }
             else return false; // unknown key = tampered, do not silently discard
             ++seen_count;
         } catch (...) { return false; }
     }
     for (int i = 0; i <= 14; ++i) if (!seen[i]) return false; // missing state = fail
-    if (seen_count != 15) return false;
+    // 15 keys = pre-v0.8 file (kepler default); 16 = v0.8 file with gravity_model.
+    if (seen_count != 15 && seen_count != 16) return false;
     if (tmp.save_version > ScenarioSave::VERSION) return false;
     out = tmp;
     return true;

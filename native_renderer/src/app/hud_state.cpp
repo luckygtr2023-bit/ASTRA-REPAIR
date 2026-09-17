@@ -34,6 +34,9 @@ HudState build_hud(const HudSnapshot& s) {
     hud.status.push_back({"FPS", fmt("%.1f", s.fps), "REAL (measured)", true});
     hud.status.push_back({"FRAME TIME", fmt("%.2f ms", s.frame_ms), "REAL (measured)", true});
     hud.status.push_back({"VIZ MODE", s.viz_mode, "SIMULATED", true});
+    hud.status.push_back({"GRAVITY",
+        s.gravity_model == "nbody" ? "NBODY velocity-Verlet dt=3600s" : "KEPLER two-body",
+        "SIMULATED", true});
 
     if (s.selected_index >= 0 && s.has_selected_kind) {
         hud.selection.push_back({"SELECTED", s.selected_name, "ENGINE ID", true});

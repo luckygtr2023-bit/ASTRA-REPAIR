@@ -32,6 +32,7 @@ struct HudSnapshot {
     int cam_mode = 0;           // 0 = orbit-follow (FOLLOW), 1 = free (FREE)
     std::string reference_frame = "heliocentric";
     std::string viz_mode = "orbital";
+    std::string gravity_model = "kepler";  // "kepler" | "nbody" (v0.8)
     // Selection (-1 = none)
     int selected_index = -1;
     std::string selected_name;

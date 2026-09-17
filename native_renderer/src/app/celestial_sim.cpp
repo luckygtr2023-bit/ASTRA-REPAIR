@@ -181,4 +181,78 @@ double SimClock::clamp_warp(double w) {
     return w < 1.0 ? 1.0 : (w > 1.0e8 ? 1.0e8 : w);
 }
 
+// ---- N-body binding (v0.8) ---------------------------------------------------
+
+const char* gravity_model_name(GravityModel m) {
+    return m == GravityModel::NBODY
+        ? "NBODY (SIMULATED · Newtonian point masses · velocity Verlet · dt=3600s)"
+        : "KEPLER (SIMULATED · two-body heliocentric)";
+}
+
+std::vector<NBody> to_nbody_state(const std::vector<CelestialBody>& bodies, double t_s) {
+    const std::vector<Vec3d> w = propagate_world(bodies, t_s);
+    const std::vector<Vec3d> v = propagate_world_velocity(bodies, t_s);
+    std::vector<NBody> out;
+    out.reserve(bodies.size());
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        NBody b;
+        b.id = bodies[i].name;         // unique by table contract
+        b.mass_kg = bodies[i].mass_kg; // DATA-DERIVED
+        b.position = Vec3m{w[i][0] * 1000.0, w[i][1] * 1000.0, w[i][2] * 1000.0}; // km -> m (SI authority)
+        b.velocity = Vec3m{v[i][0] * 1000.0, v[i][1] * 1000.0, v[i][2] * 1000.0}; // km/s -> m/s
+        out.push_back(b);
+    }
+    return out;
+}
+
+void NBodyEngine::seed(const std::vector<CelestialBody>& bodies, double t0_s) {
+    bodies_ = to_nbody_state(bodies, t0_s);
+    acc_cache_.clear();
+    t_cur_s_ = t0_s;
+    double e0 = 0.0;
+    const NBodyResult r = total_energy(bodies_, G_SI, DEFAULT_SOFTENING_M, e0);
+    e0_j_ = r.ok ? e0 : 0.0;
+    seeded_ = true;
+}
+
+bool NBodyEngine::advance_to(double t_s) {
+    if (!seeded_) return false;
+    if (t_s < t_cur_s_) return false;  // never fake backwards integration
+    while (t_cur_s_ < t_s) {
+        double dt = NBODY_DT_S;
+        if (t_cur_s_ + dt > t_s) dt = t_s - t_cur_s_;  // exact landing sub-step
+        const NBodyResult r = velocity_verlet_step(
+            bodies_, acc_cache_, dt, G_SI, DEFAULT_SOFTENING_M);
+        if (!r.ok) return false;
+        t_cur_s_ += dt;
+    }
+    return true;
+}
+
+std::vector<Vec3d> NBodyEngine::world_km() const {
+    std::vector<Vec3d> out;
+    out.reserve(bodies_.size());
+    for (const NBody& b : bodies_) {
+        out.push_back({b.position.x / 1000.0, b.position.y / 1000.0, b.position.z / 1000.0});
+    }
+    return out;
+}
+
+std::vector<Vec3d> NBodyEngine::velocity_km_s() const {
+    std::vector<Vec3d> out;
+    out.reserve(bodies_.size());
+    for (const NBody& b : bodies_) {
+        out.push_back({b.velocity.x / 1000.0, b.velocity.y / 1000.0, b.velocity.z / 1000.0});
+    }
+    return out;
+}
+
+double NBodyEngine::energy_drift_rel() const {
+    if (!seeded_ || e0_j_ == 0.0) return 0.0;
+    double e = 0.0;
+    const NBodyResult r = total_energy(bodies_, G_SI, DEFAULT_SOFTENING_M, e);
+    if (!r.ok) return 0.0;
+    return (e - e0_j_) / std::fabs(e0_j_);
+}
+
 } // namespace astra::app
