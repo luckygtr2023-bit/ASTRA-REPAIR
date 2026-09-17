@@ -7,6 +7,7 @@
 // → bridge → camera/scene/origin → diagnostics → clean startup/shutdown
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <array>
@@ -269,7 +270,12 @@ public:
     size_t cache_size() const { return cache_.size(); }
 private:
     std::unordered_map<std::string, Module> cache_;
-    std::string glslang_path_ = "/tmp/glslangValidator"; // built from /home/user/glslang
+    // Resolved from PATH (the Vulkan SDK puts glslangValidator in <SDK>/Bin);
+    // override with the ASTRA_GLSLANG_VALIDATOR environment variable.
+    std::string glslang_path_ = [] {
+        const char* env = std::getenv("ASTRA_GLSLANG_VALIDATOR");
+        return (env && *env) ? std::string(env) : std::string("glslangValidator");
+    }();
 };
 
 // -----------------------------------------------------------------------------

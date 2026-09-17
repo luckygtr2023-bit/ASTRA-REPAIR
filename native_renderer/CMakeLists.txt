@@ -90,10 +90,25 @@ target_include_directories(astra_renderer PUBLIC
     src
     src/rhi
     ${Vulkan_INCLUDE_DIRS}
-    ${ENTT_INCLUDE_DIR}
-    ${IMGUI_DIR}
-    ${MINIAUDIO_INCLUDE_DIR}
 )
+
+# Optional dependencies are consumed ONLY when actually found.
+# find_path() yields <VAR>-NOTFOUND on failure; a NOTFOUND value passed to
+# target_include_directories() is rejected by CMake at generate time, which is
+# exactly the failure this guards against. When a dependency IS found, the
+# include dir and the matching feature guard are exported to all consumers.
+if(ENTT_INCLUDE_DIR)
+    target_include_directories(astra_renderer PUBLIC ${ENTT_INCLUDE_DIR})
+    target_compile_definitions(astra_renderer PUBLIC ASTRA_HAS_ENTT=1)
+endif()
+if(IMGUI_DIR)
+    target_include_directories(astra_renderer PUBLIC ${IMGUI_DIR})
+    target_compile_definitions(astra_renderer PUBLIC ASTRA_HAS_IMGUI=1)
+endif()
+if(MINIAUDIO_INCLUDE_DIR)
+    target_include_directories(astra_renderer PUBLIC ${MINIAUDIO_INCLUDE_DIR})
+    target_compile_definitions(astra_renderer PUBLIC ASTRA_HAS_MINIAUDIO=1)
+endif()
 
 if(GLFW_FOUND)
     target_include_directories(astra_renderer PUBLIC ${GLFW_INCLUDE_DIRS})
@@ -140,30 +155,37 @@ add_executable(astra_native
 target_link_libraries(astra_native PRIVATE astra_renderer Threads::Threads)
 
 # ─── PRODUCTION Win32 + Vulkan application ────────────────────────────────────
-add_executable(astra_cosmos WIN32
-    src/main_production.cpp
-)
-set_target_properties(astra_cosmos PROPERTIES
-    OUTPUT_NAME "ASTRA COSMOS"
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-)
-target_include_directories(astra_cosmos PRIVATE
-    src
-    ${Vulkan_INCLUDE_DIRS}
-)
-target_link_libraries(astra_cosmos PRIVATE
-    astra_renderer
-    Threads::Threads
-)
-if(Vulkan_FOUND)
-    target_link_libraries(astra_cosmos PRIVATE Vulkan::Vulkan)
+# Windows-only by design (Win32 API + /SUBSYSTEM:WINDOWS in main_production.cpp).
+# Gated so the same project configures and builds cleanly on other hosts;
+# on Windows the target and its output are exactly as before.
+if(WIN32)
+    add_executable(astra_cosmos WIN32
+        src/main_production.cpp
+    )
+    set_target_properties(astra_cosmos PROPERTIES
+        OUTPUT_NAME "ASTRA COSMOS"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+    )
+    target_include_directories(astra_cosmos PRIVATE
+        src
+        ${Vulkan_INCLUDE_DIRS}
+    )
+    target_link_libraries(astra_cosmos PRIVATE
+        astra_renderer
+        Threads::Threads
+    )
+    if(Vulkan_FOUND)
+        target_link_libraries(astra_cosmos PRIVATE Vulkan::Vulkan)
+    endif()
+    if(MSVC)
+        target_compile_options(astra_cosmos PRIVATE /W3 /utf-8)
+        # WIN32 in add_executable already sets /SUBSYSTEM:WINDOWS.
+    endif()
+    message(STATUS "Production target: ASTRA COSMOS.exe (Win32 + Vulkan 1.3)")
+else()
+    message(STATUS "Production target astra_cosmos is Windows-only — skipped on ${CMAKE_SYSTEM_NAME}")
 endif()
-if(MSVC)
-    target_compile_options(astra_cosmos PRIVATE /W3 /utf-8)
-    # WIN32 in add_executable already sets /SUBSYSTEM:WINDOWS.
-endif()
-message(STATUS "Production target: ASTRA COSMOS.exe (Win32 + Vulkan 1.3)")
 # Also link renderer threads
 target_link_libraries(astra_renderer PUBLIC Threads::Threads)
 
@@ -220,16 +242,18 @@ if(GLSLANG_VALIDATOR)
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})
-    add_dependencies(astra_cosmos astra_shaders)
-    # Keep the SPIR-V next to the executable; main_production.cpp loads it from
-    # <exe_dir>/shaders at runtime (with safe fallbacks).
-    add_custom_command(TARGET astra_cosmos POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:astra_cosmos>/shaders"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ASTRA_PRODUCTION_SPV}
-                "$<TARGET_FILE_DIR:astra_cosmos>/shaders"
-        COMMENT "Installing production shaders next to ASTRA COSMOS.exe"
-        VERBATIM
-    )
+    if(WIN32)
+        add_dependencies(astra_cosmos astra_shaders)
+        # Keep the SPIR-V next to the executable; main_production.cpp loads it from
+        # <exe_dir>/shaders at runtime (with safe fallbacks).
+        add_custom_command(TARGET astra_cosmos POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:astra_cosmos>/shaders"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ASTRA_PRODUCTION_SPV}
+                    "$<TARGET_FILE_DIR:astra_cosmos>/shaders"
+            COMMENT "Installing production shaders next to ASTRA COSMOS.exe"
+            VERBATIM
+        )
+    endif()
 
     # Full visual-effects shader library — opt-in; validated statically too.
     file(GLOB_RECURSE ASTRA_LIBRARY_SHADERS
@@ -259,5 +283,11 @@ message(STATUS "ASTRA Native Renderer — C++20 Vulkan 1.3")
 message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Vulkan: ${Vulkan_FOUND} ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "  GLFW: ${GLFW_FOUND}")
-message(STATUS "  EnTT: ${ENTT_INCLUDE_DIR}")
+foreach(_astra_opt ENTT_INCLUDE_DIR IMGUI_DIR MINIAUDIO_INCLUDE_DIR)
+    if(${_astra_opt})
+        message(STATUS "  ${_astra_opt}: ${${_astra_opt}}")
+    else()
+        message(STATUS "  ${_astra_opt}: not found — using project fallback (OK)")
+    endif()
+endforeach()
 message(STATUS "  Tests: ${ASTRA_BUILD_TESTS} Tools: ${ASTRA_BUILD_TOOLS}")

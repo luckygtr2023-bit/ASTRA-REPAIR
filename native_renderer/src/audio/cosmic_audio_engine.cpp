@@ -15,12 +15,14 @@ CosmicAudioEngine::~CosmicAudioEngine(){ shutdown(); }
 bool CosmicAudioEngine::init(bool headless_mock){
     if(running_) return true;
     headless_ = headless_mock;
-#if __has_include("/home/user/miniaudio/miniaudio.h")
+// ASTRA_HAS_MINIAUDIO is defined by CMake (target_compile_definitions) when the
+// header is actually found via find_path() + MINIAUDIO_DIR — no absolute paths.
+#if defined(ASTRA_HAS_MINIAUDIO)
     // Real miniaudio would init ma_engine here
     if(!headless_){
         std::printf("[CosmicAudio] miniaudio init (would be ma_engine_init)\n");
     } else {
-        std::printf("[CosmicAudio] headless mock — miniaudio header at /home/user/miniaudio/miniaudio.h (deterministic synthesis, no device)\n");
+        std::printf("[CosmicAudio] headless mock — miniaudio header available (deterministic synthesis, no device)\n");
     }
 #else
     std::printf("[CosmicAudio] miniaudio header not found — mock synthesis\n");

@@ -18,7 +18,7 @@ bool VulkanInstance::create() {
     valid_ = true;
     return true;
 #else
-    std::printf("[Instance] Vulkan SDK not available — mock instance (headers at /home/user/Vulkan-Headers)\n");
+    std::printf("[Instance] Vulkan SDK not available — mock instance (no Vulkan headers at compile time)\n");
     std::printf("[Instance] Would create VkInstance 1.3 + VK_LAYER_KHRONOS_validation\n");
     has_validation_ = false;
     valid_ = true; // still success for static validation
@@ -186,7 +186,7 @@ void DescriptorManager::reset_pool() {}
 void DescriptorManager::destroy() { std::printf("[Descriptor] destroyed\n"); }
 
 // ---------------------------------------------------------------------
-// ShaderManager — uses real glslangValidator at /tmp/glslangValidator
+// ShaderManager — uses the system glslangValidator (Vulkan SDK, PATH-resolved)
 // ---------------------------------------------------------------------
 std::optional<ShaderManager::Module> ShaderManager::compile(const ShaderDesc& desc) {
     // Check cache
@@ -402,7 +402,7 @@ bool VulkanRHI::init(){
     has_vulkan_ = !headless_ || ASTRA_HAS_VULKAN;
     // Tease header presence
 #if ASTRA_HAS_VULKAN
-    std::printf("[RHI] Vulkan-Headers at /home/user/Vulkan-Headers — thin RHI ready for GPU\n");
+    std::printf("[RHI] Vulkan headers detected at compile time — thin RHI ready for GPU\n");
 #endif
     return true;
 }

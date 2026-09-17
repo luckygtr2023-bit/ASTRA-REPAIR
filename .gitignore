@@ -30,7 +30,9 @@ venv/
 *.pfx
 *.p12
 
-# Native renderer build trees (any build* directory under native_renderer)
+# Native renderer build trees (root "build" = the documented developer command,
+# plus any build* directory under native_renderer)
+build/
 native_renderer/build*/
 native_renderer/out/
 # CMake / MSVC / Ninja residue anywhere

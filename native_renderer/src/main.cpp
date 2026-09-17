@@ -119,7 +119,7 @@ int main(int argc, char** argv){
         auto mod = rhi.shaders().compile({p, "main", std::string(p).find(".comp")!=std::string::npos});
         if(mod) shader_ok++; else { shader_fail++; std::printf("[Shader] FAIL %s\n", p); }
     }
-    std::printf("[Shader] compiled %d ok %d fail (glslangValidator %s)\n", shader_ok, shader_fail, "/tmp/glslangValidator");
+    std::printf("[Shader] compiled %d ok %d fail (glslangValidator resolved from PATH)\n", shader_ok, shader_fail);
 
     // 5. Pipelines
     rhi.pipelines().create_graphics({"vs","fs",true,false,false,"terrain"});

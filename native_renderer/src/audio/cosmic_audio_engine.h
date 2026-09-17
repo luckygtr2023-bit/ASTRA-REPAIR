@@ -69,7 +69,8 @@ private:
     float listener_yaw_ = 0;
 
     // miniaudio would be here: ma_engine, ma_sound etc (header-only, included when not headless)
-    // For CI headless we mock, but header is available at /home/user/miniaudio/miniaudio.h
+    // For CI headless we mock. Provide the header via MINIAUDIO_DIR; CMake then
+    // defines ASTRA_HAS_MINIAUDIO and adds the include directory.
 };
 
 } // namespace astra::audio
