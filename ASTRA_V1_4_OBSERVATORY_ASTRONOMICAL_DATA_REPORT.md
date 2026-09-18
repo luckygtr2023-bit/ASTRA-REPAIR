@@ -177,7 +177,16 @@ SOURCE (2 verified upstream files + URLs + licenses + retrieval routes + sha256)
 | `native_renderer/CMakeLists.txt` | +4 production shaders |
 | `visualization/` (136 files) | **REMOVED from tracking** — completes the Godot legacy audit move (identical bytes already archived at `archive/godot_legacy_2026-09-18/visualization/`; `git diff -r` verified) |
 
-Commit recorded below in the final section after push, with exact HEAD hash and `HEAD == remote` confirmation.
+## 14. Commit sequence (this session)
+
+| Order | Commit | Content |
+|---|---|---|
+| 1 | `22dab74` | v1.4 observatory + real astronomical data (everything above) |
+| 2 | `b9b9bb8` | CMake runtime-assets install step |
+| 3 | this file finalized | report hash backfill |
+
+`HEAD == origin/arena/01a0b082-astra-repair` confirmation is stated in the
+session's final message.
 
 ---
 *Every number in this report is either a measured value from this session's runs quoted verbatim, a catalog constant from the pinned upstream bytes, or an explicit NOT VERIFIED / NOT AVAILABLE statement.*
