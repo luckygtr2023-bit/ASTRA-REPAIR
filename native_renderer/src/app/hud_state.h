@@ -50,6 +50,15 @@ struct HudSnapshot {
     double speed_km_s = 0.0;     // heliocentric speed magnitude
     double observer_distance_km = 0.0;   // distance to camera target (observer)
     double light_delay_s = 0.0;          // = observer_distance / c (approx)
+    // v1.1: relativistic derived quantities (pure functions of authoritative
+    // state — no new simulation state; mission Phase 5/6). PHYSICALLY-MODELED
+    // classifications. Each flag is independent: e.g. selecting the SUN keeps
+    // SR valid (v=0) but makes GRAV NOT AVAILABLE (r=0 degenerate metric —
+    // exact authority semantics, never a fabricated value).
+    bool has_sel_sr = false;
+    double sel_gamma_minus_one = 0.0;        // SR γ−1 from heliocentric speed
+    bool has_sel_grav = false;
+    double sel_grav_dilation_minus_one = 0.0; // weak-field dt/dτ − 1 at r_helio (Sun mass)
 };
 
 struct HudState {

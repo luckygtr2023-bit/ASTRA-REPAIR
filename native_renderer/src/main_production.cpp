@@ -55,6 +55,7 @@
 #include "app/star_lut.h"
 #include "app/render_math.h"
 #include "app/hud_text.h"
+#include "app/relativity_sim.h"
 
 // ─── Application state ────────────────────────────────────────────────────────
 static std::vector<astra::app::CelestialBody> g_bodies;
@@ -1596,6 +1597,21 @@ static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
         s.speed_km_s = std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
         s.observer_distance_km = std::sqrt((w[0]-tw[0])*(w[0]-tw[0]) + (w[1]-tw[1])*(w[1]-tw[1]) + (w[2]-tw[2])*(w[2]-tw[2]));
         s.light_delay_s = s.observer_distance_km / 299792.458;
+
+        // v1.1: relativistic derived quantities (views of authoritative state,
+        // computed through the NATIVE MIRROR of astra.relativity; flags remain
+        // precise: an invalid domain yields NOT AVAILABLE rows, never fakes).
+        {
+            double gm1 = 0.0;
+            s.has_sel_sr = (astra::app::gamma_minus_one(s.speed_km_s * 1000.0, gm1)
+                            == astra::app::RelErr::OK);
+            if (s.has_sel_sr) s.sel_gamma_minus_one = gm1;
+            double wfd = 0.0;
+            s.has_sel_grav = (astra::app::weak_field_time_dilation(
+                                  g_bodies[0].mass_kg, s.r_helio_km * 1000.0, wfd)
+                              == astra::app::RelErr::OK);
+            if (s.has_sel_grav) s.sel_grav_dilation_minus_one = wfd - 1.0;
+        }
     }
     return s;
 }

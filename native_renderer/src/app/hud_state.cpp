@@ -53,11 +53,25 @@ HudState build_hud(const HudSnapshot& s) {
             hud.selection.push_back({"SPEED", fmt("%.3f km/s", s.speed_km_s), "SIMULATED", true});
             hud.selection.push_back({"OBSERVER DIST", fmt("%.3e km", s.observer_distance_km), "SIMULATED", true});
             hud.selection.push_back({"LIGHT DELAY", fmt("%.3f s", s.light_delay_s), "SIMULATED (c=299792.458 km/s)", true});
+            if (s.has_sel_sr) {
+                hud.selection.push_back({"SR GAMMA-1", fmt("%+.3e", s.sel_gamma_minus_one),
+                    "PHYSICALLY-MODELED (SR Lorentz)", true});
+            } else {
+                hud.selection.push_back({"SR GAMMA-1", NOT_AVAILABLE, "—", false});
+            }
+            if (s.has_sel_grav) {
+                hud.selection.push_back({"GRAV DIL-1", fmt("%+.3e", s.sel_grav_dilation_minus_one),
+                    "PHYSICALLY-MODELED (weak-field Schwarzschild exterior)", true});
+            } else {
+                hud.selection.push_back({"GRAV DIL-1", NOT_AVAILABLE, "—", false});
+            }
         } else {
             hud.selection.push_back({"HELIO DIST", NOT_AVAILABLE, "—", false});
             hud.selection.push_back({"SPEED", NOT_AVAILABLE, "—", false});
             hud.selection.push_back({"OBSERVER DIST", NOT_AVAILABLE, "—", false});
             hud.selection.push_back({"LIGHT DELAY", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"SR GAMMA-1", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"GRAV DIL-1", NOT_AVAILABLE, "—", false});
         }
     } else {
         hud.selection.push_back({"SELECTED", "none", "ENGINE ID", true});

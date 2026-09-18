@@ -1,3 +1,30 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v1.1)
+
+## 0. v1.1 increment — relativity engine binding (mirror of astra.relativity)
+
+Full report: `ASTRA_V1_1_RELATIVITY_REPORT.md`. Native mirror
+(`app/relativity_sim`) of the COMPLETE authority surface (core, four_vectors,
+X-boosts, weak-field/Schwarzschild exterior, models, exceptions taxonomy),
+strict SI, identical op order. Fidelity gate: **714 comparisons, 550 numeric
+ALL BIT-EXACT (max abs/rel err 0.000e+00), 164 error rows exact** — no single
+uniform tolerance; exactness required and achieved. Semantic gates v10: 69/69.
+Real authority finding: negative scalar speeds take the low-β series branch
+(Python-confirmed 1.651037... vs closed 2.294...) — mirrored faithfully, gated,
+documented, upstream fix deferred (never hidden, never silently "corrected").
+HUD: SR GAMMA-1 / GRAV DIL-1 rows (PHYSICALLY-MODELED), strict NOT AVAILABLE
+semantics (Sun selection: SR ok / GRAV NA). No persistence change (derived
+views; formats byte-stable). No RenderState change (justified: no new
+authoritative state). Gravity remains Newtonian N-body/Kepler — SR/weak-field
+are separate read-only models (mission Phase 8 boundary intact).
+CPU-only measured perf: lorentz 4.4 ns/call, wftd 5.9 ns/call.
+Battery: v04 PASS · v05 2984 · v06 645 · v07 109 · v08 28 · v09 28 · v10 69 NEW ·
+kepler 99 · nbody 43 · rel 714/0fail · pytest 1535 · shaders 19/0 + 13/13 ·
+build 0 errors · main syntax 0 errors vs Vulkan 1.4.362.
+Statuses: SOURCE/STATIC/BUILD + CPU-VERIFIED; WINDOWS/GPU/RUNTIME(app)/VISUAL
+remain NO (environment unchanged).
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v1.0)
 
 ## 0. v1.0 increment — NBODY self-diagnostics + measured CPU profile
