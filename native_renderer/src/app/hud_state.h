@@ -77,6 +77,45 @@ struct HudSnapshot {
     bool bh_overlay_avail = false; // mirror cache built and valid
     bool bh_overlay_rays = false;  // null-geodesic ray set built and valid
     double bh_overlay_mag = 0.0;   // render units per metre (CINEMATIC transform)
+
+    // ── v1.3: DESTRUCTION/IMPACT overlay UI state (F6) — geometry SIMULATED
+    // via the verified destruction_sim mirror; UI state classification rows
+    // mirror what the renderer draws (no invented telemetry).
+    int  dk_overlay_mode = 0;          // 0 off / 1 impact view (+ fragment stream)
+    bool dk_overlay_avail = false;     // build reached (mirror accepted event)
+    int  dk_fragments = 0;             // SIMULATED output count
+    int  dk_ejecta = 0;                // SIMULATED output count
+    double dk_energy_j = 0.0;          // kinetic_energy_j from the mirror
+    double dk_deposited_j = 0.0;       // deposited_energy_j
+    char dk_damage_word[24] = "INTACT";// SIMULATED damage word from the mirror
+
+    // ── v1.3: EVOLUTION overlay UI state (F7) — series SIMULATED via the
+    // verified evolution_sim mirror; spiral axes are CINEMATIC transforms.
+    int  evo_overlay_mode = 0;         // 0 off / 1 evolution view
+    bool evo_overlay_avail = false;
+    double evo_t_final_gyr = 0.0;
+    char evo_phase_word[24] = "MAIN_SEQUENCE";
+    double evo_sfr_final = 0.0;
+
+    // ── v1.3: OBSERVATION overlay UI state (F8) — SIMULATED via the verified
+    // observation_sim mirror (temp_observe on the real ephemeris worldline).
+    int  obs_overlay_mode = 0;         // 0 off / 1 observation view
+    bool obs_overlay_avail = false;
+    double obs_lookback_s = 0.0;
+    double obs_emission_t_s = 0.0;
+    char obs_subject[24] = "";
+
+    // ── v1.3: GALACTIC halo overlay UI state (F9) — structure THEORETICAL via
+    // evolution_sim halo step; placement grid CINEMATIC (documented in source).
+    int  gala_overlay_mode = 0;        // 0 off / 1 galactic view
+    bool gala_overlay_avail = false;
+    int  gala_halo_count = 0;
+    int  gala_filaments = 0;
+
+    // ── v1.3: CPU-side overlay cost counters (REAL measurements).
+    double u13_build_ms = 0.0;         // last overlay rebuild wall cost
+    double u13_advance_ms = 0.0;       // last per-frame advance cost
+    double u13_upload_ms = 0.0;        // last per-frame upload cost
 };
 
 struct HudState {

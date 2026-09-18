@@ -66,6 +66,112 @@ HudState build_hud(const HudSnapshot& s) {
         }
     }
 
+    // ── v1.3 visual-integration rows: HUD describes EXACTLY what the
+    // renderer draws this frame — never disconnected values.
+    if (s.dk_overlay_mode != 0) {
+        if (s.dk_overlay_avail) {
+            hud.status.push_back({"DESTRUCTION VIEW (F6)",
+                fmt("KE %.3e J dep %.3e J | frag %d ejecta %d | %s",
+                    s.dk_energy_j, s.dk_deposited_j, s.dk_fragments, s.dk_ejecta,
+                    s.dk_damage_word),
+                "SIMULATED (destruction_sim mirror; pinned seed 20240918)", true});
+        } else {
+            hud.status.push_back({"DESTRUCTION VIEW (F6)", NOT_AVAILABLE,
+                                  "(authority geometry refused the pair — no overlap)", false});
+        }
+    }
+    if (s.evo_overlay_mode != 0) {
+        if (s.evo_overlay_avail) {
+            hud.status.push_back({"EVOLUTION VIEW (F7)",
+                fmt("t=%.2f Gyr SFR %.3f | stellar %s", s.evo_t_final_gyr,
+                    s.evo_sfr_final, s.evo_phase_word),
+                "SIMULATED (evolution_sim); spiral axes CINEMATIC", true});
+        } else {
+            hud.status.push_back({"EVOLUTION VIEW (F7)", NOT_AVAILABLE,
+                                  "(engine step failed — see console)", false});
+        }
+    }
+    if (s.obs_overlay_mode != 0) {
+        if (s.obs_overlay_avail) {
+            hud.status.push_back({"OBSERVATION VIEW (F8)",
+                fmt("subject %s | lookback %.6e s t_emit %.2f s",
+                    s.obs_subject, s.obs_lookback_s, s.obs_emission_t_s),
+                "SIMULATED (observation_sim temp_observe); ring span CINEMATIC", true});
+        } else {
+            hud.status.push_back({"OBSERVATION VIEW (F8)", NOT_AVAILABLE,
+                                  "(no observer/subject pair — select a body)", false});
+        }
+    }
+    if (s.gala_overlay_mode != 0) {
+        if (s.gala_overlay_avail) {
+            hud.status.push_back({"GALACTIC VIEW (F9)",
+                fmt("%d halos %d filament links", s.gala_halo_count, s.gala_filaments),
+                "counts THEORETICAL (evolution_sim halo); placement CINEMATIC grid", true});
+        } else {
+            hud.status.push_back({"GALACTIC VIEW (F9)", NOT_AVAILABLE,
+                                  "(halo build failed — see console)", false});
+        }
+    }
+    if (s.dk_overlay_mode || s.evo_overlay_mode || s.obs_overlay_mode || s.gala_overlay_mode) {
+        hud.status.push_back({"U13 OVERLAY CPU",
+            fmt("build %.2f ms advance %.2f ms upload %.2f ms",
+                s.u13_build_ms, s.u13_advance_ms, s.u13_upload_ms),
+            "REAL (measured; GPU timing NOT VERIFIED)", true});
+    }
+
+    // ── v1.3 visual-integration rows: HUD describes EXACTLY what the
+    // renderer draws this frame — never disconnected values.
+    if (s.dk_overlay_mode != 0) {
+        if (s.dk_overlay_avail) {
+            hud.status.push_back({"DESTRUCTION VIEW (F6)",
+                fmt("KE %.3e J dep %.3e J | frag %d ejecta %d | %s",
+                    s.dk_energy_j, s.dk_deposited_j, s.dk_fragments, s.dk_ejecta,
+                    s.dk_damage_word),
+                "SIMULATED (destruction_sim mirror; pinned seed 20240918)", true});
+        } else {
+            hud.status.push_back({"DESTRUCTION VIEW (F6)", NOT_AVAILABLE,
+                                  "(authority geometry refused the pair — no overlap)", false});
+        }
+    }
+    if (s.evo_overlay_mode != 0) {
+        if (s.evo_overlay_avail) {
+            hud.status.push_back({"EVOLUTION VIEW (F7)",
+                fmt("t=%.2f Gyr SFR %.3f | stellar %s", s.evo_t_final_gyr,
+                    s.evo_sfr_final, s.evo_phase_word),
+                "SIMULATED (evolution_sim); spiral axes CINEMATIC", true});
+        } else {
+            hud.status.push_back({"EVOLUTION VIEW (F7)", NOT_AVAILABLE,
+                                  "(engine step failed — see console)", false});
+        }
+    }
+    if (s.obs_overlay_mode != 0) {
+        if (s.obs_overlay_avail) {
+            hud.status.push_back({"OBSERVATION VIEW (F8)",
+                fmt("subject %s | lookback %.6e s t_emit %.2f s",
+                    s.obs_subject, s.obs_lookback_s, s.obs_emission_t_s),
+                "SIMULATED (observation_sim temp_observe); ring span CINEMATIC", true});
+        } else {
+            hud.status.push_back({"OBSERVATION VIEW (F8)", NOT_AVAILABLE,
+                                  "(no observer/subject pair — select a body)", false});
+        }
+    }
+    if (s.gala_overlay_mode != 0) {
+        if (s.gala_overlay_avail) {
+            hud.status.push_back({"GALACTIC VIEW (F9)",
+                fmt("%d halos %d filament links", s.gala_halo_count, s.gala_filaments),
+                "counts THEORETICAL (evolution_sim halo); placement CINEMATIC grid", true});
+        } else {
+            hud.status.push_back({"GALACTIC VIEW (F9)", NOT_AVAILABLE,
+                                  "(halo build failed — see console)", false});
+        }
+    }
+    if (s.dk_overlay_mode || s.evo_overlay_mode || s.obs_overlay_mode || s.gala_overlay_mode) {
+        hud.status.push_back({"U13 OVERLAY CPU",
+            fmt("build %.2f ms advance %.2f ms upload %.2f ms",
+                s.u13_build_ms, s.u13_advance_ms, s.u13_upload_ms),
+            "REAL (measured; GPU timing NOT VERIFIED)", true});
+    }
+
     if (s.selected_index >= 0 && s.has_selected_kind) {
         hud.selection.push_back({"SELECTED", s.selected_name, "ENGINE ID", true});
         hud.selection.push_back({"TYPE", s.selected_kind, "SIMULATED", true});
