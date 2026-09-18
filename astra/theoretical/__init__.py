@@ -79,3 +79,25 @@ __all__ = [
     "create_white_hole_metric", "create_alcubierre_metric",
     "get_scientific_classification", "get_classification_note",
 ]
+
+
+# v1.5 — traversal authority (FSM/plans; Morris-Thorne + Alcubierre journey surfaces)
+from astra.theoretical.traversal import (
+    C_ASTRA,
+    MouthState,
+    TraversalError,
+    TraversalPlan,
+    TraversalState,
+    WormholeTraversalFSM,
+)
+from astra.theoretical.warp_journey import WarpPlan
+
+__all__ = list(__all__) + [
+    "C_ASTRA",
+    "MouthState",
+    "TraversalError",
+    "TraversalPlan",
+    "TraversalState",
+    "WormholeTraversalFSM",
+    "WarpPlan",
+]

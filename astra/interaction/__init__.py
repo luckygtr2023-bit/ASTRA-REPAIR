@@ -67,3 +67,21 @@ __all__ = [
     "statemachine_to_dict", "statemachine_from_dict",
     "full_snapshot", "full_snapshot_from_dict",
 ]
+
+
+# v1.5 — authoritative journey engine (fills the Null travel provider)
+from astra.interaction.journey import (
+    ConventionalPlan,
+    Journey,
+    JourneyEngine,
+    JourneyError,
+    format_si,
+)
+
+__all__ = list(globals().get("__all__", [])) + [
+    "ConventionalPlan",
+    "Journey",
+    "JourneyEngine",
+    "JourneyError",
+    "format_si",
+]
