@@ -59,6 +59,16 @@ struct HudSnapshot {
     double sel_gamma_minus_one = 0.0;        // SR γ−1 from heliocentric speed
     bool has_sel_grav = false;
     double sel_grav_dilation_minus_one = 0.0; // weak-field dt/dτ − 1 at r_helio (Sun mass)
+    // v1.2: black-hole boundary scales of the CENTRAL body (pure functions of
+    // its authoritative mass through the native mirror of astra.blackhole; no
+    // new simulation state; mission Phase 5/6). PHYSICALLY-MODELED
+    // classifications. The N-body engine models central spin as ZERO, so the
+    // modeled model is SCHWARZSCHILD and Kerr rows are explicitly
+    // NOT AVAILABLE (spin not modeled by the engine — honest taxonomy).
+    bool has_sel_bh = false;
+    double sel_bh_rs_m = 0.0;      // r_s = 2GM/c^2 of the central body
+    double sel_bh_isco_m = 0.0;    // r_ISCO = 3 r_s
+    double sel_bh_photon_m = 0.0;  // r_ps = 1.5 r_s (photon sphere scale)
 };
 
 struct HudState {

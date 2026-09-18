@@ -29,7 +29,12 @@ struct HudTextSpec {
     float char_w = 0.017f;    // NDC per glyph advance (5 units + 1 gap of 6)
     float char_h = 0.033f;    // NDC per glyph height (7 grid units)
     float line_advance = -0.040f;
-    uint32_t max_lines = 22;
+    // Line budget: 22 was v0.4–v1.1 sizing (9 selection rows). v1.2 adds 5
+    // black-hole selection rows (total HUD = 25 lines incl. app_status);
+    // budget raised to 27 with headroom (still bounded; the REAL hard cap is
+    // HUD_VERTEX_CAPACITY in production). The test surface's intent —
+    // detecting truncation — is unchanged.
+    uint32_t max_lines = 27;
 };
 
 // Classification token -> color class (mirrors hud_state tokens exactly).

@@ -56,6 +56,7 @@
 #include "app/render_math.h"
 #include "app/hud_text.h"
 #include "app/relativity_sim.h"
+#include "app/black_hole_sim.h"
 
 // ─── Application state ────────────────────────────────────────────────────────
 static std::vector<astra::app::CelestialBody> g_bodies;
@@ -1611,6 +1612,26 @@ static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
                                   g_bodies[0].mass_kg, s.r_helio_km * 1000.0, wfd)
                               == astra::app::RelErr::OK);
             if (s.has_sel_grav) s.sel_grav_dilation_minus_one = wfd - 1.0;
+        }
+
+        // v1.2: black-hole boundary scales of the CENTRAL body via the native
+        // mirror of astra.blackhole (pure functions of its mass — no new
+        // state; the engine models the central spin as 0 => SCHWARZSCHILD,
+        // so Kerr rows stay NOT AVAILABLE in the HUD by design).
+        {
+            double rs = 0.0, isco = 0.0, phot = 0.0;
+            s.has_sel_bh =
+                (astra::app::bh_schwarzschild_radius_m(g_bodies[0].mass_kg, rs)
+                     == astra::app::BhErr::OK) &&
+                (astra::app::bh_isco_radius(g_bodies[0].mass_kg, isco)
+                     == astra::app::BhErr::OK) &&
+                (astra::app::bh_photon_sphere_radius(g_bodies[0].mass_kg, phot)
+                     == astra::app::BhErr::OK);
+            if (s.has_sel_bh) {
+                s.sel_bh_rs_m = rs;
+                s.sel_bh_isco_m = isco;
+                s.sel_bh_photon_m = phot;
+            }
         }
     }
     return s;

@@ -1,3 +1,44 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v1.2)
+
+## 0. v1.2 increment — black-hole & spacetime engine binding (mirrors of astra.blackhole / astra.spacetime)
+
+Full report: `ASTRA_V1_2_BLACK_HOLE_SPACETIME_REPORT.md`. Two new native
+mirrors, complete authority coverage, nothing invented: `app/black_hole_sim`
+(state + validation taxonomy, Schwarzschild with relativity-layer delegation,
+Kerr horizons/ergosphere/ZAMO/BPT-ISCO/photon orbits/equatorial dilation, full
+facade incl. the authority's delegation nuances) and `app/spacetime_sim`
+(events/charts, Matrix3/4 cofactor det+inverse verbatim, all 4 metric models,
+analytic + 4th-order-central derivatives, scale-normalized inverse,
+Christoffel(+derivative), causality, Riemann/Ricci/R/Einstein/Kretschmann/
+tidal, inline-RK4 + DOPRI5 geodesics with horizon/divergence guards, facade
+metric-correct u⁰). Fidelity gate: **6091 comparisons, 0 fails — ALL ~5.6k
+numeric values BIT-EXACT** (incl. 256-component Riemann rows through
+numeric-differentiated Kerr fields and full geodesic runs), 518 error-taxonomy
+rows exact, geodesic bit-determinism across repeat runs. Semantic gates v11:
+**101/101** (incl. closed-form anchors: extremal Kerr r± = r_g, ISCO a*→1,0
+limits bitwise, BPT root-sign equivalence, Minkowski curvature == 0, Kerr
+a*=0 metric == Schwarzschild in VALUE + documented −0.0 sign nuance).
+Authority anomalies found (NOT repaired, mirrored + gated + documented):
+KerrMetric(a*=0) g_tph = −0.0 vs Schwarzschild +0.0; numeric-stencil
+coordinate-patch exits at absurdly small radii (DegenerateMetricError, both
+languages). HUD: 5 black-hole selection rows (R_S/ISCO/PHOT SPH/MODEL =
+PHYSICALLY-MODELED or SIMULATED; KERR SPIN = honest NOT AVAILABLE — engine
+models central spin as 0). Persistence: no change (derived views only; byte
+formats stable). HUD text line budget 22 → 27 (row growth; truncation
+detectors keep their meaning). Pre-existing v1.1 latent op-divergence fixed
+surgically: `relvec_magnitude` → authority's exact hypot(hypot(x,y),z) chain;
+all v1.1 references re-verified green.
+CPU-only measured perf (GCC -O2 sandbox): ISCO 63.5 ns, ZAMO ω 21.3 ns,
+Christoffel 549 ns, Kretschmann 17.3 µs, geodesic 2.29 µs/step.
+Battery: v04 PASS · v05 2984 · v06 645 · v07 109 · v08 28 · v09 28 · v10 69 ·
+v11 101 NEW · rel 714/0 · kepler 99/0 · nbody PASS · bhst 6091/0 · pytest
+1535/1535 · shaders 48/48 compile-verified · cmake build 0 errors (mirrors in
+libastra_renderer.a) · main syntax 0 errors vs Win32 stub + Vulkan 1.4.362.
+Statuses: SOURCE/STATIC/BUILD + CPU-VERIFIED; WINDOWS/GPU/RUNTIME(app)/VISUAL
+remain NO (BLOCKED — ENVIRONMENT LIMITATION, unchanged).
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v1.1)
 
 ## 0. v1.1 increment — relativity engine binding (mirror of astra.relativity)

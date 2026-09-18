@@ -114,7 +114,14 @@ RelVec3 operator*(const RelVec3& v, double s) {
 }
 
 double relvec_magnitude(const RelVec3& v) {
-    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    // v1.2 fix: mirror astra.mathematics.vectors.Vector3.magnitude() EXACTLY —
+    // the authority computes math.hypot(math.hypot(x, y), z), not sqrt(sumsq).
+    // Both coincide on axial inputs; for general directions the hypot form is
+    // the authority's op chain and is what the mirror must reproduce bitwise.
+    // (sqrt(x²+y²+z²) could drift ±1ulp; all prior bit-exact rows used values
+    // where both agree, so this cannot regress any load-bearing comparison:
+    // the generator's expected values still come from the Python authority.)
+    return std::hypot(std::hypot(v.x, v.y), v.z);
 }
 
 RelErr relativistic_momentum(double m0, const RelVec3& v, RelVec3& out) {

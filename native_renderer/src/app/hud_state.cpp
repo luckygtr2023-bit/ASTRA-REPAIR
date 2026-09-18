@@ -65,6 +65,24 @@ HudState build_hud(const HudSnapshot& s) {
             } else {
                 hud.selection.push_back({"GRAV DIL-1", NOT_AVAILABLE, "—", false});
             }
+            if (s.has_sel_bh) {
+                hud.selection.push_back({"BH R_S (CTR)", fmt("%.3e m", s.sel_bh_rs_m),
+                    "PHYSICALLY-MODELED (Schwarzschild scale of central mass; never claimed a real BH)", true});
+                hud.selection.push_back({"BH ISCO (CTR)", fmt("%.3e m", s.sel_bh_isco_m),
+                    "PHYSICALLY-MODELED (static Schwarzschild, test particle)", true});
+                hud.selection.push_back({"BH PHOT SPH (CTR)", fmt("%.3e m", s.sel_bh_photon_m),
+                    "PHYSICALLY-MODELED (static Schwarzschild, test particle)", true});
+                hud.selection.push_back({"BH MODEL (CTR)", "SCHWARZSCHILD (spin=0 modeled)",
+                    "SIMULATED (engine model choice)", true});
+                hud.selection.push_back({"BH KERR SPIN", NOT_AVAILABLE,
+                    "— (central spin not modeled by the N-body engine)", false});
+            } else {
+                hud.selection.push_back({"BH R_S (CTR)", NOT_AVAILABLE, "—", false});
+                hud.selection.push_back({"BH ISCO (CTR)", NOT_AVAILABLE, "—", false});
+                hud.selection.push_back({"BH PHOT SPH (CTR)", NOT_AVAILABLE, "—", false});
+                hud.selection.push_back({"BH MODEL (CTR)", NOT_AVAILABLE, "—", false});
+                hud.selection.push_back({"BH KERR SPIN", NOT_AVAILABLE, "—", false});
+            }
         } else {
             hud.selection.push_back({"HELIO DIST", NOT_AVAILABLE, "—", false});
             hud.selection.push_back({"SPEED", NOT_AVAILABLE, "—", false});
@@ -72,6 +90,11 @@ HudState build_hud(const HudSnapshot& s) {
             hud.selection.push_back({"LIGHT DELAY", NOT_AVAILABLE, "—", false});
             hud.selection.push_back({"SR GAMMA-1", NOT_AVAILABLE, "—", false});
             hud.selection.push_back({"GRAV DIL-1", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"BH R_S (CTR)", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"BH ISCO (CTR)", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"BH PHOT SPH (CTR)", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"BH MODEL (CTR)", NOT_AVAILABLE, "—", false});
+            hud.selection.push_back({"BH KERR SPIN", NOT_AVAILABLE, "—", false});
         }
     } else {
         hud.selection.push_back({"SELECTED", "none", "ENGINE ID", true});
