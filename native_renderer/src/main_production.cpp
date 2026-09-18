@@ -1472,6 +1472,15 @@ static void gravity_refresh_world() {
     g_vel = astra::app::propagate_world_velocity(g_bodies, g_clock.sim_time_s);
 }
 
+// v1.0: engine self-diagnostics for the HUD (SIMULATED measurement).
+static void nbody_export_diagnostics(astra::app::HudSnapshot& s) {
+    if (g_gravity == astra::app::GravityModel::NBODY && g_nbody.seeded()) {
+        s.has_nbody_drift = true;
+        s.nbody_drift_rel = g_nbody.energy_drift_rel();
+        s.nbody_time_s = g_nbody.time_s();
+    }
+}
+
 static void sim_tick(double real_dt_s) {
     if (g_step_once) {
         // Single simulation step: one wall-frame worth of warped sim time.
@@ -1564,7 +1573,7 @@ static void update_camera_from_input(double real_dt_s) {
 static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
     astra::app::HudSnapshot s{};
     s.sim_time_s = g_clock.sim_time_s;
-    s.warp = g_clock.warp; s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler";
+    s.warp = g_clock.warp; s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler"; nbody_export_diagnostics(s);
     s.paused = g_clock.paused;
     s.fps = fps;
     s.frame_ms = frame_ms;

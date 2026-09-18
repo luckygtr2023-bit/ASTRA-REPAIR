@@ -1,3 +1,20 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v1.0)
+
+## 0. v1.0 increment — NBODY self-diagnostics + measured CPU profile
+
+Full report: `ASTRA_V1_0_REPORT.md`. HUD rows NBODY TIME / NBODY E DRIFT
+(SIMULATED-classified, nbody-only, absent without data — no fabricated
+numbers). Measured engine profile on this sandbox (CPU-only, steady_clock,
+labeled): 1,561,521 velocity-Verlet steps/s (10 bodies); 10 sim-years in
+0.054 s wall; drift −4.458e-9 (bounded); Earth |r| = 1.0177 AU after 10 yr.
+Statuses: SOURCE/STATIC/BUILD VERIFIED; PERFORMANCE VERIFIED (CPU/engine,
+this machine only — explicitly NOT GPU/Windows); WINDOWS/GPU/RUNTIME(app)/
+VISUAL NOT VERIFIED. Battery: v04 PASS · v05 2984 · v06 645 · v07 109 ·
+v08 28 · v09 28 NEW · kepler 99 · nbody 43 · pytest 1535 · shaders 19/0+13/13 ·
+build 0 errors · main syntax 0 errors vs Vulkan 1.4.362.
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v0.9)
 
 ## 0. v0.9 increment — exact N-body state persistence (bit-exact resume)

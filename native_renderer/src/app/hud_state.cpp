@@ -37,6 +37,12 @@ HudState build_hud(const HudSnapshot& s) {
     hud.status.push_back({"GRAVITY",
         s.gravity_model == "nbody" ? "NBODY velocity-Verlet dt=3600s" : "KEPLER two-body",
         "SIMULATED", true});
+    if (s.gravity_model == "nbody" && s.has_nbody_drift) {
+        hud.status.push_back({"NBODY TIME", fmt("%.1f d", s.nbody_time_s / 86400.0),
+                              "SIMULATED", true});
+        hud.status.push_back({"NBODY E DRIFT", fmt("%+.2e rel", s.nbody_drift_rel),
+                              "SIMULATED (engine self-diagnostic)", true});
+    }
 
     if (s.selected_index >= 0 && s.has_selected_kind) {
         hud.selection.push_back({"SELECTED", s.selected_name, "ENGINE ID", true});

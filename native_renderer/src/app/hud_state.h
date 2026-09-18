@@ -33,6 +33,11 @@ struct HudSnapshot {
     std::string reference_frame = "heliocentric";
     std::string viz_mode = "orbital";
     std::string gravity_model = "kepler";  // "kepler" | "nbody" (v0.8)
+    // v1.0: N-body engine self-diagnostics (SIMULATED measurement of the
+    // engine itself; only meaningful when gravity_model == "nbody").
+    bool has_nbody_drift = false;
+    double nbody_drift_rel = 0.0;
+    double nbody_time_s = 0.0;
     // Selection (-1 = none)
     int selected_index = -1;
     std::string selected_name;
