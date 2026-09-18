@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate native_renderer without Vulkan SDK — 60+ checks for Phase01+02+03, mirrors validate_godot_project.py"""
+"""Validate native_renderer without Vulkan SDK — 60+ checks for Phase01+02+03; historically mirrored the archived prototype validator (now at archive/godot_legacy_2026-09-18/visualization/tools/validate_godot_project.py — read-only history, not used by this build)."""
 import pathlib, re, sys, json
 # Resolve relative to this file — must work from any working directory.
 ROOT = pathlib.Path(__file__).resolve().parents[1]

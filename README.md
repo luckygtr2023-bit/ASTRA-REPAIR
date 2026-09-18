@@ -51,7 +51,7 @@ The optional scientific/product Python dependencies remain declared by `pyprojec
 
 **Release builders only:** `distribution/build_bootstrap.cmd` uses the .NET SDK to publish the proposed Windows GUI host with a private runtime. `distribution/release_tools.py` audits runtime archives, enforces reviewed acceptance evidence, generates pinned catalogs and assembles the bootstrap ZIP. Neither tool is shipped as an end-user prerequisite. The release tool explicitly refuses the known diagnostic native main. No public release was uploaded.
 
-> Source of Truth: This README documents the actual repository as inspected 2026-09-17. No fabrication. The end-user runtime is the native C++20/Vulkan path (`native_renderer/`); the repository also contains a separate experimental Godot 4.4 visualization track under `visualization/`, which is **not** part of the Windows runtime distribution.
+> Source of Truth: This README documents the actual repository as inspected 2026-09-18. No fabrication. The end-user runtime is the native C++20/Vulkan path (`native_renderer/`). The former experimental Godot 4.4 track (`visualization/` + `GODOT_PHASES/`) was audited (see `ASTRA_GODOT_LEGACY_AUDIT.md`) and archived out of the active tree to `archive/godot_legacy_2026-09-18/` — read-only history, **not** part of the Windows runtime distribution.
 
 ---
 
@@ -364,9 +364,8 @@ ASTRA-COSMOS/
 ├── native_renderer/ (CMakeLists.txt 0.1.0, launcher/launcher.cpp 258 lines, src/ 52 subdirs, shaders/ 36, assets/, tools/validate 221 OK, tests/ 91)
 ├── supabase/ (config.toml, migrations 11 tables 7 buckets RLS)
 ├── tests/ (~84 scientific tests)
-├── visualization/ (placeholder, no engine)
+├── archive/godot_legacy_2026-09-18/ (preserved Godot 4.4 prototype + phase specs; audit: ASTRA_GODOT_LEGACY_AUDIT.md; NOT engine, NOT built, NOT shipped)
 ├── release/ASTRA-COSMOS/ (bin/astra_native 161K ELF, shaders, assets, documentation, config, runtime, data)
-├── GODOT_PHASES/ (spec markdowns, NOT engine)
 └── pyproject.toml (astra-core 0.1.1)
 ```
 

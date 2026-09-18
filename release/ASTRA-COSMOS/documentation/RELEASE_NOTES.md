@@ -66,7 +66,7 @@ Launcher checks files, initializes ASTRA, launches `native_renderer/astra_native
 - **Visual:** No HDR display capture, crack seams / horizon cull / bloom 0.35 / TAA ghosting / FSR2 real upscaling not GPU-verified (FSR2 is scaffolding 258w fallback copy, honestly labeled)
 - **Hardware:** FPS 60/30 across Intel UHD LOW vs RTX 40 ULTRA requires real hardware; mesh shader `VK_EXT_mesh_shader` not tested; Tracy not running; Supabase local not running (offline mock)
 - **Product:** Supabase local `supabase start` not in CI, realtime not live; Google OAuth secrets in dashboard not code (correct)
-- No Godot/Blender, no service_role, no `sb_secret_`, no fake benchmarks
+- No Godot/Blender, no service_role, no `sb_secret_`, no fake benchmarks (legacy Godot 4.4 prototype archived 2026-09-18 at `archive/godot_legacy_2026-09-18/`)
 
 ---
 

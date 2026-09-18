@@ -76,6 +76,8 @@ renderdoc capture ./build/astra_native --scene benchmark
 
 See `ASTRA_MAXIMUM_RENDERER_REPORT.md` §10. With Godot 6.8/10 (fast), without (this) 8.7/10 ceiling (AAA). This renderer is `POSSIBLE WITH CONDITIONS` for AAA — target is HDR+PBR+volumetrics+TAA+60fps, not marketing.
 
+_The Godot 4.4 prototype was audited and archived on 2026-09-18 (`archive/godot_legacy_2026-09-18/`; audit: `ASTRA_GODOT_LEGACY_AUDIT.md`). This native track is the single production visualization pipeline: ASTRA Scientific Engine → RenderState → Native C++ Renderer → Vulkan → GPU._
+
 ## Scientific Authority
 
 `Bridge::poll("bridge_state.json")` 30Hz hash, `FloatingOrigin::world_to_relative = world - camera_origin` double→float, `WorldHierarchy 5 levels` DAG, no `teleport`, `SPECULATIVE` wormhole distinct shader + label, `Telemetry` `draw_calls 60fps`.

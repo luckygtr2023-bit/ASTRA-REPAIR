@@ -132,7 +132,7 @@ Do not write into `C:\Windows\` or `C:\Program Files\Windows*`; normal user acco
 - `ASTRA COSMOS.exe` built as ELF named `.exe` on Linux for validation; true Windows PE cross-compile `x86_64-w64-mingw32-g++` **NOT VERIFIED** (no mingw in CI) — logic verified on Linux, PE requires Windows build env
 - Tracy/RenderDoc not installed in CI (only `src/profiling/tracy.cpp` source), no `.rdc` capture
 - Supabase local not running in CI (offline simulator)
-- No Godot/Blender dependency (intentionally), no `VK_EXT_mesh_shader` tested, FSR2 is scaffolding (258w fallback copy, not real temporal upscaling)
+- No Godot/Blender dependency (intentionally; legacy Godot prototype archived 2026-09-18 at `archive/godot_legacy_2026-09-18/`), no `VK_EXT_mesh_shader` tested, FSR2 is scaffolding (258w fallback copy, not real temporal upscaling)
 - See `COPYRIGHT.md` for third-party licenses, `ASTRA_FINAL_RELEASE_AUDIT.md` for full audit
 
 ---
