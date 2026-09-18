@@ -177,6 +177,55 @@ std::vector<Vec3d> propagate_world_velocity(const std::vector<CelestialBody>& bo
     return world;
 }
 
+std::string pack_nbody_state(const NBodyEngine& eng) {
+    if (!eng.seeded()) return "";
+    char buf[512];
+    std::string out;
+    std::snprintf(buf, sizeof buf, "%.17e", eng.time_s());
+    out = buf;
+    for (const NBody& b : eng.bodies()) {
+        std::snprintf(buf, sizeof buf, ",%.17e,%.17e,%.17e,%.17e,%.17e,%.17e",
+                      b.position.x, b.position.y, b.position.z,
+                      b.velocity.x, b.velocity.y, b.velocity.z);
+        out += buf;
+    }
+    return out;
+}
+
+bool unpack_nbody_state(const std::string& packed,
+                        const std::vector<CelestialBody>& scene,
+                        std::vector<NBody>& out_bodies, double& out_t_s) {
+    std::vector<std::string> toks;
+    std::string cur;
+    for (char c : packed) {
+        if (c == ',') { toks.push_back(cur); cur.clear(); }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) toks.push_back(cur);
+    if (toks.size() != 1 + 6 * scene.size()) return false;
+    std::vector<double> vals(toks.size());
+    for (size_t i = 0; i < toks.size(); ++i) {
+        try {
+            size_t used = 0;
+            vals[i] = std::stod(toks[i], &used);
+            if (used != toks[i].size() || !std::isfinite(vals[i])) return false;
+        } catch (...) { return false; }
+    }
+    out_bodies.clear();
+    out_bodies.reserve(scene.size());
+    for (size_t i = 0; i < scene.size(); ++i) {
+        NBody b;
+        b.id = scene[i].name;       // packed order IS scene order by contract
+        b.mass_kg = scene[i].mass_kg;
+        const double* v = &vals[1 + 6 * i];
+        b.position = Vec3m{v[0], v[1], v[2]};
+        b.velocity = Vec3m{v[3], v[4], v[5]};
+        out_bodies.push_back(b);
+    }
+    out_t_s = vals[0];
+    return true;
+}
+
 double SimClock::clamp_warp(double w) {
     return w < 1.0 ? 1.0 : (w > 1.0e8 ? 1.0e8 : w);
 }
@@ -245,6 +294,24 @@ std::vector<Vec3d> NBodyEngine::velocity_km_s() const {
         out.push_back({b.velocity.x / 1000.0, b.velocity.y / 1000.0, b.velocity.z / 1000.0});
     }
     return out;
+}
+
+bool NBodyEngine::restore(const std::vector<NBody>& bodies, double t_s) {
+    if (bodies.empty() || !std::isfinite(t_s)) return false;
+    for (const NBody& b : bodies) {
+        if (!(b.mass_kg > 0.0) || !std::isfinite(b.mass_kg) || b.id.empty()) return false;
+        const double vals[] = {b.position.x, b.position.y, b.position.z,
+                               b.velocity.x, b.velocity.y, b.velocity.z};
+        for (double v : vals) if (!std::isfinite(v)) return false;
+    }
+    bodies_ = bodies;
+    acc_cache_.clear();      // recomputed from positions — cache is derivable
+    t_cur_s_ = t_s;
+    double e0 = 0.0;
+    const NBodyResult r = total_energy(bodies_, G_SI, DEFAULT_SOFTENING_M, e0);
+    e0_j_ = r.ok ? e0 : 0.0;
+    seeded_ = true;
+    return true;
 }
 
 double NBodyEngine::energy_drift_rel() const {

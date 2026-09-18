@@ -28,6 +28,12 @@ struct ScenarioSave {
     // pre-v0.8 files (15 keys) parse with the "kepler" default; unknown values
     // fail the load like any tamper.
     std::string gravity_model = "kepler";
+    // v0.9: exact N-body engine state ("t,x,y,z,vx,vy,vz,..."), 1+6k finite
+    // doubles (k >= 1 bodies), optional. Empty = no integrated state; NBODY
+    // load re-anchors from the ephemeris (documented, loud). Non-empty REQUIRES
+    // gravity_model == "nbody" (a Kepler save carrying an N-body state is a
+    // contradiction = tamper, rejected).
+    std::string nbody_state;
     int save_version = VERSION;
 };
 

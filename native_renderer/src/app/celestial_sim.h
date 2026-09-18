@@ -130,6 +130,11 @@ public:
     // and reseed instead). Final sub-step lands exactly on t_s.
     bool advance_to(double t_s);
     const std::vector<NBody>& bodies() const { return bodies_; }
+    // v0.9: exact restore (bit-exact resume, NEVER a re-approximation).
+    // Validates sizes and finiteness; clears the acceleration cache (it is
+    // recomputed on the next step, identical to what a continuous run would
+    // have because the cache derives from positions alone).
+    bool restore(const std::vector<NBody>& bodies, double t_s);
     // World state converted back to the app's units (heliocentric km / km/s).
     std::vector<Vec3d> world_km() const;
     std::vector<Vec3d> velocity_km_s() const;
@@ -144,6 +149,16 @@ private:
     double e0_j_ = 0.0;
     bool seeded_ = false;
 };
+
+// v0.9: exact engine-state packing for scenario persistence. Format is the
+// persist.cpp contract ("t,x,y,z,vx,vy,vz,..." SI doubles, 1+6k tokens).
+// Engine time is recorded so a load resumes the integrated trajectory
+// BIT-EXACTLY; unpack additionally enforces the body id order of the caller's
+// scene (id mismatch = reject, never silently re-shuffle scientific state).
+std::string pack_nbody_state(const NBodyEngine& eng);
+bool unpack_nbody_state(const std::string& packed,
+                        const std::vector<CelestialBody>& scene,
+                        std::vector<NBody>& out_bodies, double& out_t_s);
 
 // ---- Simulation clock (sim seconds, explicit warp, pausable) ----------------
 struct SimClock {

@@ -1,3 +1,21 @@
+# ASTRA COSMOS — IMPLEMENTATION STATUS (v0.9)
+
+## 0. v0.9 increment — exact N-body state persistence (bit-exact resume)
+
+Full report: `ASTRA_V0_9_REPORT.md`. NBODY scenario saves now carry the full
+integrated engine state (`nbody_state`, %.17e SI) and F3 resumes it
+**bit-exactly** (zero-tolerance gate: uninterrupted == save→restore→resume for
+positions AND velocities, incl. double save/load cycles); v0.8/pre-v0.8 files
+still load; kepler+state contradiction and structural tamper rejected; engine
+restore validates mass/finiteness and derives the acceleration cache on the
+next step (proven equivalent). Statuses: SOURCE/STATIC/BUILD VERIFIED;
+WINDOWS/GPU/RUNTIME(app)/VISUAL/PERFORMANCE NOT VERIFIED (env unchanged).
+Battery: v04 PASS · v05 2984 · v06 645 · v07 109 · v08 28 NEW · kepler 99 ·
+nbody 43 · pytest 1535 · shaders 19/0 + 13/13 · build 0 errors · main syntax
+0 errors vs Vulkan 1.4.362.
+
+---
+
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v0.8)
 
 ## 0. v0.8 increment — native N-body engine (roadmap #13 partial: N-body)

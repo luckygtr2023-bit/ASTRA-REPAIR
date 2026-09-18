@@ -355,7 +355,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case VK_F2: {    // F2 save scenario (persistence; traversal-safe names)
             astra::app::ScenarioSave s{};
             s.sim_time_s = g_clock.sim_time_s; s.warp = g_clock.warp; s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler"; s.paused = g_clock.paused;
-            s.gravity_model = (g_gravity == astra::app::GravityModel::NBODY) ? "nbody" : "kepler";
+            s.nbody_state = (g_gravity == astra::app::GravityModel::NBODY && g_nbody.seeded())
+                                ? astra::app::pack_nbody_state(g_nbody) : "";
             s.focus = g_focus; s.selection = g_selection;
             s.cam_mode = (g_cam_mode == CamMode::FREE) ? 1 : 0;
             s.cam_azimuth = g_camera.azimuth; s.cam_elevation = g_camera.elevation; s.cam_distance = g_camera.distance;
@@ -376,7 +377,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_clock.sim_time_s = s.sim_time_s; g_clock.warp = s.warp; g_clock.paused = s.paused; g_gravity = (s.gravity_model == "nbody")
                            ? astra::app::GravityModel::NBODY
                            : astra::app::GravityModel::KEPLER;
-                g_nbody.reset();
+                if (s.gravity_model == "nbody" && !s.nbody_state.empty()) {
+                    std::vector<astra::app::NBody> nb; double t_s = 0.0;
+                    if (astra::app::unpack_nbody_state(s.nbody_state, g_bodies, nb, t_s) &&
+                        g_nbody.restore(nb, t_s)) {
+                        g_clock.sim_time_s = t_s;  // engine time is authoritative
+                        printf("[ASTRA] NBODY state restored EXACTLY at t=%.2f s\n", t_s);
+                    } else {
+                        printf("[ASTRA] NBODY state INVALID — re-anchoring from ephemeris\n");
+                        g_nbody.reset();
+                    }
+                } else {
+                    g_nbody.reset();
+                }
                 g_focus = std::clamp(s.focus, 0, (int)g_bodies.size() - 1);
                 g_selection = (s.selection >= 0 && s.selection < (int)g_bodies.size()) ? s.selection : -1;
                 g_cam_mode = (s.cam_mode == 1) ? CamMode::FREE : CamMode::FOLLOW;
