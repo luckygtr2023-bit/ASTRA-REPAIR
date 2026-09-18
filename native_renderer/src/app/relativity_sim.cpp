@@ -1,4 +1,5 @@
 #include "relativity_sim.h"
+#include "app/py_math.h"
 
 #include <cmath>
 
@@ -118,10 +119,11 @@ double relvec_magnitude(const RelVec3& v) {
     // the authority computes math.hypot(math.hypot(x, y), z), not sqrt(sumsq).
     // Both coincide on axial inputs; for general directions the hypot form is
     // the authority's op chain and is what the mirror must reproduce bitwise.
-    // (sqrt(x²+y²+z²) could drift ±1ulp; all prior bit-exact rows used values
-    // where both agree, so this cannot regress any load-bearing comparison:
-    // the generator's expected values still come from the Python authority.)
-    return std::hypot(std::hypot(v.x, v.y), v.z);
+    // v1.3 hardening: Python math.hypot is CPython vector_norm (not libm hypot);
+    // py_math.h py_magnitude3 ports it verbatim. std::hypot agreed with CPython on
+    // prior corpora but diverges by ±1ulp on some inputs (proven by destruction
+    // fragment-velocity rows); the same latent risk applied here, now closed.
+    return py_magnitude3(v.x, v.y, v.z);
 }
 
 RelErr relativistic_momentum(double m0, const RelVec3& v, RelVec3& out) {

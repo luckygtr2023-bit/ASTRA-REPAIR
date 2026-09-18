@@ -3,6 +3,7 @@
 // Classification: outputs SIMULATED_DATA; RNG REAL (CPython-ported draws).
 
 #include "destruction_sim.h"
+#include "app/py_math.h"
 
 #include <cmath>
 #include <cfloat>
@@ -18,74 +19,6 @@ inline double pyround(double x) { return std::nearbyint(x); }
 
 inline bool fin(double v) { return !std::isnan(v) && !std::isinf(v); }
 } // namespace
-
-// CPython 3.11 Modules/mathmodule.c vector_norm() + math_hypot() — VERBATIM PORT.
-// Authority Vector3.magnitude() is math.hypot(math.hypot(x, y), z). CPython math.hypot is NOT
-// libm hypot (diverges by ulps on some inputs): it scales by ldexp(1, -frexp(max).exponent),
-// Veltkamp–Dekker splits each scaled component, accumulates compensated fracs, and applies one
-// differential-correction step. std::hypot happened to agree on earlier mirror corpora but does
-// NOT bit-match CPython in general (proven by fragment-velocity divergence), so we mirror the
-// exact algorithm. Only the IEEE/Glibc-valid fast path and the subnormal fallback are needed
-// (inputs are finite by validation; inf/NaN produced only in non-executed invalid states).
-static double py_vector_norm(int n, const double* vec, double mx) {
-    const double T27 = 134217729.0; // ldexp(1,27)+1
-    double x, scale, oldcsum, csum = 1.0, frac1 = 0.0, frac2 = 0.0, frac3 = 0.0;
-    double t, hi, lo, h;
-    if (std::isinf(mx)) return mx;
-    if (mx == 0.0 || n <= 1) return mx;
-    int max_e = 0;
-    std::frexp(mx, &max_e);
-    if (max_e >= -1023) {
-        scale = std::ldexp(1.0, -max_e);
-        for (int i = 0; i < n; ++i) {
-            x = vec[i];
-            x *= scale;
-            t = x * T27;
-            hi = t - (t - x);
-            lo = x - hi;
-            x = hi * hi;
-            oldcsum = csum; csum += x; frac1 += (oldcsum - csum) + x;
-            x = 2.0 * hi * lo;
-            oldcsum = csum; csum += x; frac2 += (oldcsum - csum) + x;
-            frac3 += lo * lo;
-        }
-        h = std::sqrt(csum - 1.0 + (frac1 + frac2 + frac3));
-        x = h;
-        t = x * T27;
-        hi = t - (t - x);
-        lo = x - hi;
-        x = -hi * hi;
-        oldcsum = csum; csum += x; frac1 += (oldcsum - csum) + x;
-        x = -2.0 * hi * lo;
-        oldcsum = csum; csum += x; frac2 += (oldcsum - csum) + x;
-        x = -lo * lo;
-        oldcsum = csum; csum += x; frac3 += (oldcsum - csum) + x;
-        x = csum - 1.0 + (frac1 + frac2 + frac3);
-        return (h + x / (2.0 * h)) / scale;
-    }
-    // Subnormal-extreme fallback: divide by max.
-    for (int i = 0; i < n; ++i) {
-        x = vec[i];
-        x /= mx;
-        x = x * x;
-        oldcsum = csum; csum += x; frac1 += (oldcsum - csum) + x;
-    }
-    return mx * std::sqrt(csum - 1.0 + frac1);
-}
-
-static double py_hypot2(double a, double b) {
-    double coords[2] = {std::fabs(a), std::fabs(b)};
-    double mx = 0.0;
-    for (int i = 0; i < 2; ++i) {
-        if (coords[i] > mx) mx = coords[i]; // mirrors CPython: NaN never updates max
-    }
-    if (std::isnan(coords[0]) || std::isnan(coords[1])) return std::nan("");
-    return py_vector_norm(2, coords, mx);
-}
-
-static double py_magnitude3(double x, double y, double z) {
-    return py_hypot2(py_hypot2(x, y), z);
-}
 
 double DestVec3::magnitude() const {
     return py_magnitude3(x, y, z);

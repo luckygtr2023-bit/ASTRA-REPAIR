@@ -6,6 +6,8 @@
 //   ImpactValidationError -> IMPACT_VALIDATION
 //   NumericalError        -> NUMERICAL
 //   LimitExceededError    -> LIMIT_EXCEEDED
+#include "app/py_math.h"
+#include <cctype>
 #include <cstdarg>
 #include <cmath>
 #include <cstdio>
@@ -87,7 +89,13 @@ static std::string numstr(double v) {
 static void check_num(const std::string& ref, double got, const std::string& ctx) {
     const std::string gs = numstr(got);
     if (ref == gs) { ++g_ok; ++g_bit; return; }
-    double rv = std::strtod(ref.c_str(), nullptr);
+    double rv;
+    {
+        const char* endp = nullptr;
+        if (!py_strtod(ref.c_str(), &endp, &rv) || !(*endp == '\0' || std::isspace((unsigned char)*endp))) {
+            rv = std::strtod(ref.c_str(), nullptr);
+        }
+    }
     if (rv == got && std::signbit(rv) == std::signbit(got)) { ++g_ok; ++g_bit; return; }
     ++g_fail;
     report("[FAIL] %s: ref=%s got=%s\n", ctx.c_str(), ref.c_str(), gs.c_str());
