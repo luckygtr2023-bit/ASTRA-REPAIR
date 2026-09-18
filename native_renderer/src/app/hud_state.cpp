@@ -1,5 +1,6 @@
 #include "hud_state.h"
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
@@ -33,6 +34,16 @@ HudState build_hud(const HudSnapshot& s) {
     }
     hud.status.push_back({"FPS", fmt("%.1f", s.fps), "REAL (measured)", true});
     hud.status.push_back({"FRAME TIME", fmt("%.2f ms", s.frame_ms), "REAL (measured)", true});
+    // ── v1.4 REAL catalog status (provenance always visible, never implied).
+    if (s.cat_available) {
+        hud.status.push_back({"CATALOG DATASET", fmt("HYG v4.1 + OpenNGC (%u stars, %u DSOs)",
+                              (unsigned)s.cat_star_count, (unsigned)s.cat_dso_count), "REAL DATA (CC BY-SA 4.0)", true});
+        hud.status.push_back({"CATALOG LAYER 'C'",
+                              s.cat_mode == 0 ? "OFF" : (s.cat_mode == 1 ? "STARS" : "STARS+DSO"),
+                              "REAL DATA (display shell CINEMATIC)", true});
+    } else {
+        hud.status.push_back({"CATALOG DATASET", NOT_AVAILABLE, "NOT AVAILABLE (dataset unverified/absent)", false});
+    }
     hud.status.push_back({"VIZ MODE", s.viz_mode, "SIMULATED", true});
     hud.status.push_back({"GRAVITY",
         s.gravity_model == "nbody" ? "NBODY velocity-Verlet dt=3600s" : "KEPLER two-body",
@@ -232,6 +243,64 @@ HudState build_hud(const HudSnapshot& s) {
         hud.selection.push_back({"SPEED", NOT_AVAILABLE, "—", false});
         hud.selection.push_back({"OBSERVER DIST", NOT_AVAILABLE, "—", false});
         hud.selection.push_back({"LIGHT DELAY", NOT_AVAILABLE, "—", false});
+    }
+
+    // ── v1.4 catalog selection measurement (observer-relative; REAL parallax).
+    if (s.cat_available && s.cat_sel) {
+        hud.selection.push_back({"V14 STAR", s.cat_sel_label, "REAL DATA (HYG v4.1)", true});
+        if (s.cat_sel_spect[0]) {
+            hud.selection.push_back({"SPECTRAL TYPE", s.cat_sel_spect, "REAL DATA (MK class)", true});
+        } else {
+            hud.selection.push_back({"SPECTRAL TYPE", NOT_AVAILABLE, "—", false});
+        }
+        hud.selection.push_back({"RA/DEC FROM OBSERVER",
+            fmt("%.6f / %+.6f deg%s", s.cat_sel_ra_deg, s.cat_sel_dec_deg,
+                s.cat_meas_epoch_y == 0.0 ? "" : fmt(" @J2000%+.0fy", s.cat_meas_epoch_y).c_str()),
+            "DATA-DERIVED (from real catalog position; ICRS)", true});
+        if (!std::isnan(s.cat_sel_dist_ly)) {
+            hud.selection.push_back({"DISTANCE (OBSERVER)", fmt("%.4f ly", s.cat_sel_dist_ly), "DATA-DERIVED (real position)", true});
+            hud.selection.push_back({"LIGHT-TRAVEL TIME", fmt("%.4f yr", s.cat_sel_delay_y), "DATA-DERIVED (=distance/c)", true});
+        } else {
+            hud.selection.push_back({"DISTANCE (OBSERVER)", NOT_AVAILABLE, "NOT AVAILABLE (dist >= 100000 pc sentinel)", false});
+            hud.selection.push_back({"LIGHT-TRAVEL TIME", NOT_AVAILABLE, "—", false});
+        }
+        if (!std::isnan(s.cat_sel_mag)) {
+            hud.selection.push_back({"APPARENT MAG (OBSERVER)", fmt("%.3f", s.cat_sel_mag), "DATA-DERIVED (distance modulus)", true});
+        } else {
+            hud.selection.push_back({"APPARENT MAG (OBSERVER)", NOT_AVAILABLE, "—", false});
+        }
+        hud.selection.push_back({"FORMAL UNCERTAINTY", NOT_AVAILABLE, "NOT AVAILABLE (CSV distribution has none)", false});
+    } else if (s.cat_available && s.cat_mode > 0) {
+        hud.selection.push_back({"V14 STAR", "none ('U' measures center-of-view)", "—", false});
+    }
+    if (s.cat_available && s.dso_sel) {
+        hud.selection.push_back({"V14 DSO", s.dso_sel_label, "REAL DATA (OpenNGC)", true});
+        if (!std::isnan(s.dso_sel_z)) {
+            hud.selection.push_back({"REDSHIFT Z", fmt("%+.6f", s.dso_sel_z), "REAL DATA (measured)", true});
+            hud.selection.push_back({"DIST PROXY", fmt("%.2f Mpc", s.dso_sel_dist_proxy_mpc), "DATA-DERIVED (H0=70 Hubble proxy)", true});
+        } else {
+            hud.selection.push_back({"REDSHIFT Z", NOT_AVAILABLE, "NOT AVAILABLE (not measured)", false});
+        }
+        const char* ty = "OTHER";
+        switch (s.dso_sel_type_code) {
+            case 7: ty = "GALAXY"; break;
+            case 11: ty = "PLANETARY NEBULA"; break;
+            case 4: ty = "OPEN CLUSTER"; break;
+            case 5: ty = "GLOBULAR CLUSTER"; break;
+            case 15: ty = "NEBULA"; break;
+            case 17: ty = "SUPERNOVA REMNANT"; break;
+            default: break;
+        }
+        hud.selection.push_back({"DSO TYPE", ty, "REAL DATA (catalog class)", true});
+        if (!std::isnan(s.dso_sel_vmag)) {
+            hud.selection.push_back({"V MAGNITUDE", fmt("%.2f", s.dso_sel_vmag), "REAL DATA", true});
+        } else {
+            hud.selection.push_back({"V MAGNITUDE", NOT_AVAILABLE, "—", false});
+        }
+        if (!std::isnan(s.dso_sel_maj_arcmin)) {
+            hud.selection.push_back({"ANGULAR SIZE", fmt("%.2f arcmin", s.dso_sel_maj_arcmin), "REAL DATA", true});
+        }
+        hud.selection.push_back({"HUBBLE-LAW Z->D", "linear approx H0=70", "DATA-DERIVED (approximation)", true});
     }
 
     hud.frame.push_back({"CAMERA", s.cam_mode == 0 ? "orbit-follow" : "free", "UI STATE", true});

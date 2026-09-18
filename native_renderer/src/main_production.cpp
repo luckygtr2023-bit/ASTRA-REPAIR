@@ -53,6 +53,9 @@
 #include "app/audio_bus.h"
 #include "app/persist.h"
 #include "app/star_lut.h"
+// v1.4: REAL astronomical catalog (astra.catalog authority; sha256-verified)
+#include "catalog/astro_catalog.h"
+#include <cstdio>
 #include "app/render_math.h"
 #include "app/hud_text.h"
 #include "app/relativity_sim.h"
@@ -214,6 +217,34 @@ static constexpr uint32_t BH_VB_VERTEX_CAPACITY = 8192; // 291 ring verts + 5005
 static VkBuffer g_bh_vb = VK_NULL_HANDLE;
 static VkDeviceMemory g_bh_vb_mem = VK_NULL_HANDLE;
 static void* g_bh_vb_mapped = nullptr;
+// ─── v1.4: REAL catalog data path (SOURCE→STATE→GPU→HUD); all provenance rows
+//     appear in the HUD via hud_state; NaN ⇒ NOT AVAILABLE, never substituted.
+static astra::catalog::StarCatalog g_starcatalog;
+static astra::catalog::DsoCatalog  g_dsocatalog;
+static bool     g_cat_ok = false;
+static std::string g_cat_why = "not loaded";
+static int      g_cat_mode = 1;            // 0 off / 1 stars / 2 stars+dso ('C')
+static VkBuffer g_cat_star_buf = VK_NULL_HANDLE;
+static VkDeviceMemory g_cat_star_mem = VK_NULL_HANDLE;
+static void*    g_cat_star_mapped = nullptr;
+static VkBuffer g_cat_dso_buf = VK_NULL_HANDLE;
+static VkDeviceMemory g_cat_dso_mem = VK_NULL_HANDLE;
+static void*    g_cat_dso_mapped = nullptr;
+static VkDescriptorSetLayout g_dsl_cat = VK_NULL_HANDLE;
+static VkDescriptorSet g_ds_cat_stars = VK_NULL_HANDLE;
+static VkDescriptorSet g_ds_cat_dsos = VK_NULL_HANDLE;
+static VkPipelineLayout g_layout_cat = VK_NULL_HANDLE;
+static VkPipeline g_pipe_cat_stars = VK_NULL_HANDLE;
+static VkPipeline g_pipe_cat_dso = VK_NULL_HANDLE;
+static double   g_cat_last_origin[3] = {1.0e30, 1.0e30, 1.0e30}; // force first build
+static size_t   g_cat_sel = SIZE_MAX;      // selected catalog star ('U' key)
+static bool     g_cat_sel_dirty = false;
+static size_t   g_dso_sel = SIZE_MAX;
+static bool     g_dso_sel_dirty = false;
+static astra::catalog::StarMeasurement g_cat_meas{};
+static bool     g_cat_meas_valid = false;
+static double   g_cat_meas_years = 0.0;    // 'T': J2000+t observation epoch (proper-motion view)
+static constexpr double CAT_SHELL_UNITS = 90000.0; // scene sky sphere (z_far 100000)
 static VkPipeline g_pipe_bright = VK_NULL_HANDLE;
 static VkPipeline g_pipe_blur = VK_NULL_HANDLE;
 static VkPipeline g_pipe_composite = VK_NULL_HANDLE;
@@ -446,6 +477,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case 'P': g_show_apsis = !g_show_apsis; break;   // peri/apo tick marks
         case 'G': g_show_axes = !g_show_axes; break;     // reference-frame axes
         case 'H': g_hud_enabled = !g_hud_enabled; break; // in-canvas HUD toggle
+        case 'C': g_cat_mode = (g_cat_mode + 1) % 3; break; // v1.4 REAL catalog layer
+        case 'U': {   // v1.4 measure nearest catalog object to screen center
+            if (g_cat_ok) {
+                const double tw[3] = {g_world[(size_t)g_focus][0], g_world[(size_t)g_focus][1], g_world[(size_t)g_focus][2]};
+                float off_f[3]; g_camera.eye_offset(off_f);
+                double n = std::sqrt((double)off_f[0]*off_f[0] + (double)off_f[1]*off_f[1] + (double)off_f[2]*off_f[2]);
+                if (n > 0.0) {
+                    const double fwd[3] = {-off_f[0]/n, -off_f[1]/n, -off_f[2]/n};
+                    g_cat_sel = astra::catalog::nearest_star_by_direction(g_starcatalog, tw, fwd);
+                    g_cat_sel_dirty = true;
+                    g_dso_sel = astra::catalog::nearest_dso_by_direction(g_dsocatalog, fwd);
+                    g_dso_sel_dirty = true;
+                    printf("[ASTRA] v1.4 measured catalog objects (see HUD)\n");
+                }
+            } else {
+                printf("[ASTRA] v1.4 catalog NOT AVAILABLE — measurement refused (no fabricated results)\n");
+            }
+        } break;
+        case 'T': {   // v1.4 observation epoch: J2000 ± 10k years (proper-motion view, DATA_DERIVED)
+            g_cat_meas_years += 10000.0;
+            if (g_cat_meas_years > 20000.0) g_cat_meas_years = -20000.0;
+            g_cat_sel_dirty = true;
+            printf("[ASTRA] v1.4 observation epoch J2000 %+0.0f yr\n", g_cat_meas_years);
+        } break;
         case VK_OEM_4: {                         // [ — exposure down (CINEMATIC display param)
             g_exposure = astra::app::clamp_exposure(g_exposure / 1.25f);
             printf("[ASTRA] exposure = x%.3f (CINEMATIC; scientific state unchanged)\n", g_exposure);
@@ -900,6 +955,66 @@ static bool create_sampler() {
     return true;
 }
 
+// ─── v1.4: catalog ingestion (binary authority → CPU doubles → GPU floats) ───
+static std::string g_star_lut_pixels; static int g_star_lut_w = 0, g_star_lut_h = 0; static bool g_star_lut_ok = false;
+
+static void v14_color_from_temp(double temp_k, float out_rgb[3], void* /*ctx*/) {
+    if (std::isnan(temp_k) || !g_star_lut_ok) {
+        out_rgb[0] = out_rgb[1] = out_rgb[2] = 0.8f; // NOT AVAILABLE → neutral, labeled
+        return;
+    }
+    const astra::app::RgbF c = astra::app::star_color_from_lut(g_star_lut_pixels, g_star_lut_w, g_star_lut_h, temp_k);
+    out_rgb[0] = c.r; out_rgb[1] = c.g; out_rgb[2] = c.b;
+}
+
+static std::string fmt_hip(uint32_t hip) {
+    char b[24];
+    snprintf(b, sizeof(b), " / HIP %u", (unsigned)hip);
+    return std::string(b);
+}
+
+static bool init_catalog() {
+    // 1) project star LUT (PHYSICALLY_MODELED colors) — cache for BOTH the sun
+    //    row and the catalog instances.
+    const std::string luts[] = {exe_dir() + "\\assets\\star_temperature_lut.ppm",
+                                "assets\\star_temperature_lut.ppm",
+                                "..\\assets\\star_temperature_lut.ppm",
+                                "native_renderer\\assets\\star_temperature_lut.ppm",
+                                "star_temperature_lut.ppm",
+                                "assets/star_temperature_lut.ppm",
+                                "native_renderer/assets/star_temperature_lut.ppm"};
+    for (const auto& pth : luts) {
+        if (astra::app::load_ppm_p3(pth, g_star_lut_w, g_star_lut_h, g_star_lut_pixels)) { g_star_lut_ok = true; break; }
+    }
+    printf("[ASTRA] v1.4 star LUT: %s\n", g_star_lut_ok ? "LOADED (blackbody PH/MODELED)" : "NOT AVAILABLE");
+    // 2) REAL catalogs (fail-closed; load failures ⇒ catalog unavailable,
+    //    HUD NOT AVAILABLE; the app continues — never substituted data).
+    const std::string starp[] = {exe_dir() + "\\assets\\astro_stars.v14.bin",
+                                 "assets\\astro_stars.v14.bin",
+                                 "..\\assets\\astro_stars.v14.bin",
+                                 "native_renderer\\assets\\astro_stars.v14.bin",
+                                 "assets/astro_stars.v14.bin",
+                                 "native_renderer/assets/astro_stars.v14.bin"};
+    const std::string dsop[] = {exe_dir() + "\\assets\\astro_dso.v14.bin",
+                                "assets\\astro_dso.v14.bin",
+                                "..\\assets\\astro_dso.v14.bin",
+                                "native_renderer\\assets\\astro_dso.v14.bin",
+                                "assets/astro_dso.v14.bin",
+                                "native_renderer/assets/astro_dso.v14.bin"};
+    std::string why1 = "not found", why2 = "not found";
+    bool ok1 = false, ok2 = false;
+    for (const auto& pth : starp) { if (astra::catalog::load_star_catalog(pth, g_starcatalog, why1)) { ok1 = true; break; } }
+    for (const auto& pth : dsop) { if (astra::catalog::load_dso_catalog(pth, g_dsocatalog, why2)) { ok2 = true; break; } }
+    g_cat_ok = ok1 && ok2;
+    if (!ok1) g_cat_why = "stars: " + why1;
+    if (!ok2) g_cat_why += (ok1 ? "" : " | "); if (!ok2) g_cat_why += "dso: " + why2;
+    printf(ok1 && ok2 ? "[ASTRA] v1.4 catalog: HYG v4.1 %llu stars + OpenNGC %llu DSOs — REAL DATA (sha256-verified)\n"
+                      : "[ASTRA] v1.4 catalog: NOT AVAILABLE (%s) — HUD rows will honestly show NOT AVAILABLE\n",
+           ok1 && ok2 ? (unsigned long long)g_starcatalog.count : 0ull,
+           ok1 && ok2 ? (unsigned long long)g_dsocatalog.count : 0ull, g_cat_why.c_str());
+    return true; // pipeline owns catalogs; never initializer-fatal
+}
+
 // ─── v0.5/v0.6: GPU instancing + culling + driven buffers (host-coherent) ────
 static bool create_gpu_instancing() {
     const VkDeviceSize inst_bytes = (VkDeviceSize)INSTANCE_CAPACITY * sizeof(astra::app::BodyInstance);
@@ -926,6 +1041,19 @@ static bool create_gpu_instancing() {
     VK_CHECK(vkMapMemory(g_device, g_mask_mem, 0, mask_bytes, 0, &g_mask_mapped));
     VK_CHECK(vkMapMemory(g_device, g_hud_vb_mem, 0, hud_bytes, 0, &g_hud_vb_mapped));
     VK_CHECK(vkMapMemory(g_device, g_bh_vb_mem, 0, bh_bytes, 0, &g_bh_vb_mapped));
+    // v1.4: catalog instance SSBOs (mapped; content written on origin-change builds).
+    const VkDeviceSize cat_star_bytes = (VkDeviceSize)std::max<size_t>(1, g_starcatalog.count)
+                                        * sizeof(astra::catalog::CatStarViz);
+    const VkDeviceSize cat_dso_bytes = (VkDeviceSize)std::max<size_t>(1, g_dsocatalog.count)
+                                       * sizeof(astra::catalog::CatDsoViz);
+    if (!create_upload_buffer(cat_star_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_cat_star_buf, g_cat_star_mem)) { ++g_perf.alloc_failures; return false; }
+    if (!create_upload_buffer(cat_dso_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_cat_dso_buf, g_cat_dso_mem)) { ++g_perf.alloc_failures; return false; }
+    VK_CHECK(vkMapMemory(g_device, g_cat_star_mem, 0, cat_star_bytes, 0, &g_cat_star_mapped));
+    VK_CHECK(vkMapMemory(g_device, g_cat_dso_mem, 0, cat_dso_bytes, 0, &g_cat_dso_mapped));
+    memset(g_cat_star_mapped, 0, (size_t)cat_star_bytes);
+    memset(g_cat_dso_mapped, 0, (size_t)cat_dso_bytes);
     memset(g_inst_mapped, 0, (size_t)inst_bytes);
     memset(g_mask_mapped, 0, (size_t)mask_bytes);
     memset(g_hud_vb_mapped, 0, (size_t)hud_bytes);
@@ -949,12 +1077,12 @@ static bool create_gpu_instancing() {
 static bool create_descriptors() {
     VkDescriptorPoolSize sizes[2]{};
     sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[0].descriptorCount = 8;
+    sizes[0].descriptorCount = 12;
     sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     sizes[1].descriptorCount = 12;
     VkDescriptorPoolCreateInfo pci{};
     pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pci.maxSets = 8;
+    pci.maxSets = 12;
     pci.poolSizeCount = 2;
     pci.pPoolSizes = sizes;
     VK_CHECK(vkCreateDescriptorPool(g_device, &pci, nullptr, &g_desc_pool));
@@ -980,6 +1108,10 @@ static bool create_descriptors() {
     p2[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     p2[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     if (!make_layout(p2, 2, g_dsl_post2)) return false;
+    // v1.4 catalog stars/DSOs share one SSBO-per-set layout (vertex stage).
+    VkDescriptorSetLayoutBinding catb[1]{};
+    catb[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    if (!make_layout(catb, 1, g_dsl_cat)) return false;
 
     const auto alloc = [&](VkDescriptorSetLayout l, VkDescriptorSet& out) {
         VkDescriptorSetAllocateInfo ai{};
@@ -996,6 +1128,8 @@ static bool create_descriptors() {
     if (!alloc(g_dsl_post1, g_ds_blur_a)) return false;
     if (!alloc(g_dsl_post1, g_ds_blur_b)) return false;
     if (!alloc(g_dsl_post2, g_ds_composite)) return false;
+    if (!alloc(g_dsl_cat, g_ds_cat_stars)) return false;
+    if (!alloc(g_dsl_cat, g_ds_cat_dsos)) return false;
 
     // Static buffer bindings (SSBOs never change identity).
     VkDescriptorBufferInfo bi{g_inst_buf, 0, VK_WHOLE_SIZE};
@@ -1015,6 +1149,13 @@ static bool create_descriptors() {
     w2[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bh, nullptr};
     w2[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_compute, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bc, nullptr};
     vkUpdateDescriptorSets(g_device, 2, w2, 0, nullptr);
+    // v1.4: catalog SSBO bindings (buffers allocated in create_gpu_instancing).
+    VkDescriptorBufferInfo bcs{g_cat_star_buf, 0, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo bcd{g_cat_dso_buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet wc[2]{};
+    wc[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_cat_stars, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bcs, nullptr};
+    wc[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_cat_dsos, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bcd, nullptr};
+    vkUpdateDescriptorSets(g_device, 2, wc, 0, nullptr);
     return true;
 }
 
@@ -1372,6 +1513,50 @@ static bool make_pipeline(const uint32_t* vs, size_t vs_words, const uint32_t* f
     return true;
 }
 
+// v1.4: additive-blended strip pipeline for catalog billboards (SSBO-driven,
+// no vertex input; depth-test on / depth-write off so bodies occlude stars).
+static bool make_pipeline_blend(const uint32_t* vs, size_t vs_words,
+                                const uint32_t* fs, size_t fs_words,
+                                VkPipelineLayout layout, VkPipeline& out) {
+    VkShaderModule vm = create_shader_module(std::vector<uint32_t>(vs, vs + vs_words));
+    VkShaderModule fm = create_shader_module(std::vector<uint32_t>(fs, fs + fs_words));
+    if (!vm || !fm) { printf("[ASTRA] v1.4 catalog shader module failed\n"); return false; }
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vm, "main", nullptr};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fm, "main", nullptr};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, nullptr, 0, 0, nullptr, 0, nullptr};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                              nullptr, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_FALSE};
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, nullptr, 0, 1, nullptr, 1, nullptr};
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, nullptr, 0, VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable = VK_TRUE; ds.depthWriteEnable = VK_FALSE; ds.depthCompareOp = VK_COMPARE_OP_LESS;
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.blendEnable = VK_TRUE;
+    cba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.colorBlendOp = VK_BLEND_OP_ADD;
+    cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, nullptr, 0, VK_FALSE, VK_LOGIC_OP_NO_OP, 1, &cba};
+    VkDynamicState dyns[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, nullptr, 0, 2, dyns};
+    VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pi.stageCount = 2; pi.pStages = stages; pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia;
+    pi.pViewportState = &vp; pi.pRasterizationState = &rs; pi.pMultisampleState = &ms;
+    pi.pDepthStencilState = &ds; pi.pColorBlendState = &cb; pi.pDynamicState = &dy;
+    pi.layout = layout; pi.renderPass = g_pass_scene; pi.subpass = 0;
+    const VkResult res = vkCreateGraphicsPipelines(g_device, VK_NULL_HANDLE, 1, &pi, nullptr, &out);
+    vkDestroyShaderModule(g_device, vm, nullptr);
+    vkDestroyShaderModule(g_device, fm, nullptr);
+    if (res != VK_SUCCESS) { printf("[ASTRA] v1.4 catalog pipeline failed: %d\n", (int)res); return false; }
+    return true;
+}
+
 static bool create_pipelines() {
     // Shared 128-byte push-constant range for every layout (superset policy).
     VkPushConstantRange pcr{};
@@ -1392,9 +1577,11 @@ static bool create_pipelines() {
     if (!make_layout(g_dsl_post1, true, g_layout_post1)) return false;
     if (!make_layout(g_dsl_post2, true, g_layout_post2)) return false;
     if (!make_layout(g_dsl_compute, true, g_layout_compute)) return false;
+    if (!make_layout(g_dsl_cat, true, g_layout_cat)) return false;
 
     std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f, vector_v,
-                          bh_shell_v, cull_c, bright_f, blur_f, composite_f, hud_v, hud_f;
+                          bh_shell_v, cull_c, bright_f, blur_f, composite_f, hud_v, hud_f,
+                          cat_stars_v, cat_stars_f, cat_dso_v, cat_dso_f;
     if (!load_shader("astra.vert.spv", astra_v)) return false;
     if (!load_shader("astra.frag.spv", astra_f)) return false;
     if (!load_shader("sphere.vert.spv", sphere_v)) return false;
@@ -1409,6 +1596,11 @@ static bool create_pipelines() {
     if (!load_shader("post_composite.frag.spv", composite_f)) return false;
     if (!load_shader("hud_text.vert.spv", hud_v)) return false;
     if (!load_shader("hud_text.frag.spv", hud_f)) return false;
+    // v1.4 REAL catalog shaders (glslangValidator SPIR-V; compile-verified).
+    if (!load_shader("v14_cat_stars.vert.spv", cat_stars_v)) return false;
+    if (!load_shader("v14_cat_stars.frag.spv", cat_stars_f)) return false;
+    if (!load_shader("v14_cat_dso.vert.spv", cat_dso_v)) return false;
+    if (!load_shader("v14_cat_dso.frag.spv", cat_dso_f)) return false;
 
     // Scene pipelines (HDR pass).
     if (!make_pipeline(astra_v.data(), astra_v.size(), astra_f.data(), astra_f.size(),
@@ -1427,6 +1619,11 @@ static bool create_pipelines() {
     if (!make_pipeline(bh_shell_v.data(), bh_shell_v.size(), orbit_f.data(), orbit_f.size(),
                        VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, true,
                        g_layout_scene, g_pass_scene, g_pipe_bh_shell)) return false;
+    // v1.4: REAL catalog stars + deep-sky objects (additive billboards, SSBO-driven).
+    if (!make_pipeline_blend(cat_stars_v.data(), cat_stars_v.size(), cat_stars_f.data(), cat_stars_f.size(),
+                             g_layout_cat, g_pipe_cat_stars)) return false;
+    if (!make_pipeline_blend(cat_dso_v.data(), cat_dso_v.size(), cat_dso_f.data(), cat_dso_f.size(),
+                             g_layout_cat, g_pipe_cat_dso)) return false;
     // Post pipelines (fullscreen triangle, no depth).
     if (!make_pipeline(astra_v.data(), astra_v.size(), bright_f.data(), bright_f.size(),
                        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
@@ -1667,6 +1864,54 @@ static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
     s.bh_overlay_avail = (g_bh_overlay != 0) && g_bh_built && g_bh_ov.valid;
     s.bh_overlay_rays  = g_bh_rays.valid;
     s.bh_overlay_mag   = g_bh_ov.valid ? g_bh_ov.magnification : 0.0;
+    // ── v1.4 REAL catalog state → HUD (classifications exact from the data).
+    s.cat_available = g_cat_ok;
+    s.cat_mode = g_cat_mode;
+    s.cat_star_count = (uint32_t)g_starcatalog.count;
+    s.cat_dso_count = (uint32_t)g_dsocatalog.count;
+    if (g_cat_ok) {
+        snprintf(s.cat_status_word, sizeof(s.cat_status_word), "HYG v4.1 %u stars / OpenNGC %u DSOs",
+                 (unsigned)g_starcatalog.count, (unsigned)g_dsocatalog.count);
+    } else {
+        snprintf(s.cat_status_word, sizeof(s.cat_status_word), "%.60s", g_cat_why.c_str());
+    }
+    s.cat_meas_epoch_y = g_cat_meas_years;
+    if (g_cat_ok && g_cat_sel_dirty && g_cat_sel != SIZE_MAX) {
+        const auto& rec = g_starcatalog.records[g_cat_sel];
+        const double tw3[3] = {g_world[(size_t)g_focus][0], g_world[(size_t)g_focus][1], g_world[(size_t)g_focus][2]};
+        g_cat_meas = astra::catalog::measure_star_at_epoch(rec, g_starcatalog.pos_km_ecl[g_cat_sel],
+                                                           tw3, g_cat_meas_years);
+        g_cat_meas_valid = true;
+        g_cat_sel_dirty = false;
+    }
+    if (g_cat_ok && g_cat_meas_valid && g_cat_sel != SIZE_MAX) {
+        const auto& rec = g_starcatalog.records[g_cat_sel];
+        s.cat_sel = true;
+        snprintf(s.cat_sel_label, sizeof(s.cat_sel_label), "HYG %llu%s", (unsigned long long)rec.hyg_id,
+                 rec.hip_id ? fmt_hip(rec.hip_id).c_str() : "");
+        if (rec.spect_key > 0 && rec.spect_key <= (uint32_t)g_starcatalog.spect_table.size() - 1u)
+            snprintf(s.cat_sel_spect, sizeof(s.cat_sel_spect), "%.30s", g_starcatalog.spect_table[rec.spect_key].c_str());
+        s.cat_sel_ra_deg = g_cat_meas.observer_ra_deg_icrs;
+        s.cat_sel_dec_deg = g_cat_meas.observer_dec_deg_icrs;
+        s.cat_sel_dist_ly = g_cat_meas.distance_ly;
+        s.cat_sel_delay_y = g_cat_meas.light_delay_years;
+        s.cat_sel_mag = g_cat_meas.apparent_mag;
+    }
+    if (g_cat_ok && g_dso_sel != SIZE_MAX) {
+        const auto& d = g_dsocatalog.records[g_dso_sel];
+        s.dso_sel = true;
+        {
+            char nm[25]{}; memcpy(nm, d.name, 24);
+            snprintf(s.dso_sel_label, sizeof(s.dso_sel_label), "%.24s", nm);
+        }
+        s.dso_sel_z = d.redshift;
+        s.dso_sel_radvel = d.radvel_km_s;
+        s.dso_sel_vmag = d.v_mag;
+        s.dso_sel_maj_arcmin = d.maj_arcmin;
+        s.dso_sel_dist_proxy_mpc = d.dist_proxy_mpc;
+        s.dso_sel_type_code = d.type_code;
+    }
+
     return s;
 }
 
@@ -1826,6 +2071,32 @@ static bool render_frame(double fps) {
         vkCmdWriteTimestamp(g_cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_gpu_ts_pool, 0);
     }
 
+    // ── v1.4: rebuild catalog instances when the observer origin moved ≥1e5 km
+    //     (parallax-preserving sphere; exact data from sha-verified records).
+    if (g_cat_ok && g_cat_mode > 0) {
+        const double* tw3 = g_world[(size_t)g_focus];
+        const double mdx = std::fabs(tw3[0] - g_cat_last_origin[0]) +
+                           std::fabs(tw3[1] - g_cat_last_origin[1]) +
+                           std::fabs(tw3[2] - g_cat_last_origin[2]);
+        if (mdx > 1.0e5) {
+            static std::vector<astra::catalog::CatStarViz> starviz;
+            const auto t0 = std::chrono::steady_clock::now();
+            astra::catalog::build_star_viz(g_starcatalog, tw3, CAT_SHELL_UNITS,
+                                           v14_color_from_temp, nullptr, starviz);
+            memcpy(g_cat_star_mapped, starviz.data(), starviz.size() * sizeof(astra::catalog::CatStarViz));
+            if (g_cat_mode > 1) {
+                static std::vector<astra::catalog::CatDsoViz> dsoviz;
+                astra::catalog::build_dso_viz(g_dsocatalog, tw3, CAT_SHELL_UNITS, dsoviz);
+                memcpy(g_cat_dso_mapped, dsoviz.data(), dsoviz.size() * sizeof(astra::catalog::CatDsoViz));
+            }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            printf("[ASTRA] v1.4 catalog instance rebuild: %zu stars (+DSOs) in %.2f ms (REAL measured CPU)\n",
+                   starviz.size(), ms);
+            memcpy(g_cat_last_origin, tw3, 3 * sizeof(double));
+        }
+    }
+
     // ── View/projection (floating origin at the camera target) ──
     const astra::app::Vec3d& target = g_world[(size_t)g_focus];
     const float aspect = (float)g_sc_extent.width / (float)g_sc_extent.height;
@@ -1971,6 +2242,52 @@ static bool render_frame(double fps) {
                            0, 16, bg_pc);
         vkCmdDraw(g_cmd_buf, 3, 1, 0, 0);
         ++g_perf.draw_calls;
+
+        // 2a'. v1.4 REAL catalog stars/DSOs (provenance: HYG v4.1 + OpenNGC via
+        //      sha256-verified binaries; instanced additive billboards;
+        //      depth-tested so bodies occlude background sky correctly).
+        if (g_cat_ok && g_cat_mode > 0 && g_starcatalog.count > 0) {
+            struct CatPC { float vp[16]; float right[4]; float up[4]; float misc[4]; } cpc{};
+            memcpy(cpc.vp, view_proj.m, sizeof(cpc.vp));
+            // camera basis in scene units from eye offset (see OrbitCamera::view)
+            {
+                const float fd[3] = {-eye[0], -eye[1], -eye[2]};
+                const float fl = std::sqrt(fd[0]*fd[0] + fd[1]*fd[1] + fd[2]*fd[2]);
+                const float f[3] = {fd[0]/fl, fd[1]/fl, fd[2]/fl};
+                // right = normalize(cross(f, (0,1,0))), up' = cross(right, f)
+                float rx = -f[2];
+                float ry = 0.0f;
+                float rz = f[0];
+                const float rl = std::sqrt(rx*rx + ry*ry + rz*rz);
+                if (rl > 1e-8f) { rx/=rl; ry/=rl; rz/=rl; }
+                // camera up' = cross(right, f)
+                const float ux = ry*f[2] - rz*f[1];
+                const float uy = rz*f[0] - rx*f[2];
+                const float uz = rx*f[1] - ry*f[0];
+                cpc.right[0]=rx; cpc.right[1]=ry; cpc.right[2]=rz; cpc.right[3]=1.0f;
+                cpc.up[0]=ux; cpc.up[1]=uy; cpc.up[2]=uz; cpc.up[3]=1.0f;
+                cpc.misc[0] = (float)std::tan((g_camera.fov_deg * 3.141592653589793 / 180.0) * 0.5);
+                cpc.misc[1] = (float)g_sc_extent.height;
+                cpc.misc[2] = (g_cat_sel_dirty || g_cat_sel == SIZE_MAX) ? -1.0f : (float)g_cat_sel;
+                cpc.misc[3] = 0.0f;
+            }
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_cat_stars);
+            vkCmdPushConstants(g_cmd_buf, g_layout_cat, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(cpc), &cpc);
+            vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_cat,
+                                    0, 1, &g_ds_cat_stars, 0, nullptr);
+            vkCmdDraw(g_cmd_buf, 4, (uint32_t)g_starcatalog.count, 0, 0);
+            ++g_perf.draw_calls;
+            if (g_cat_mode > 1 && g_dsocatalog.count > 0) {
+                vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_cat_dso);
+                vkCmdPushConstants(g_cmd_buf, g_layout_cat, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   0, sizeof(cpc), &cpc);
+                vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_cat,
+                                        0, 1, &g_ds_cat_dsos, 0, nullptr);
+                vkCmdDraw(g_cmd_buf, 4, (uint32_t)g_dsocatalog.count, 0, 0);
+                ++g_perf.draw_calls;
+            }
+        }
 
         // 2b. Instanced bodies — GPU-DRIVEN indirect draws (LOW, HIGH batch).
         // Instance counts come ONLY from GPU-written commands (zero CPU list
@@ -2319,6 +2636,14 @@ static void cleanup() {
     if (g_indirect_buf) vkDestroyBuffer(g_device, g_indirect_buf, nullptr);
     if (g_hud_vb) vkDestroyBuffer(g_device, g_hud_vb, nullptr);
     if (g_bh_vb) vkDestroyBuffer(g_device, g_bh_vb, nullptr);
+    if (g_cat_star_buf) vkDestroyBuffer(g_device, g_cat_star_buf, nullptr);
+    if (g_cat_dso_buf) vkDestroyBuffer(g_device, g_cat_dso_buf, nullptr);
+    if (g_cat_star_mem) vkFreeMemory(g_device, g_cat_star_mem, nullptr);
+    if (g_cat_dso_mem) vkFreeMemory(g_device, g_cat_dso_mem, nullptr);
+    if (g_pipe_cat_stars) vkDestroyPipeline(g_device, g_pipe_cat_stars, nullptr);
+    if (g_pipe_cat_dso) vkDestroyPipeline(g_device, g_pipe_cat_dso, nullptr);
+    if (g_layout_cat) vkDestroyPipelineLayout(g_device, g_layout_cat, nullptr);
+    if (g_dsl_cat) vkDestroyDescriptorSetLayout(g_device, g_dsl_cat, nullptr);
     if (g_inst_mem) vkFreeMemory(g_device, g_inst_mem, nullptr);
     if (g_mask_mem) vkFreeMemory(g_device, g_mask_mem, nullptr);
     if (g_bh_vb_mem) vkFreeMemory(g_device, g_bh_vb_mem, nullptr);
@@ -2410,12 +2735,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (!create_geometry())   { printf("[ASTRA] Geometry failed\n"); cleanup(); return 1; }
     if (!create_sampler())    { printf("[ASTRA] Sampler failed\n"); cleanup(); return 1; }
     if (!create_gpu_timestamps()){ printf("[ASTRA] Timestamp pool failed\n"); cleanup(); return 1; }
+    init_catalog();  // v1.4 REAL catalog (must precede SSBO sizing)
     if (!create_gpu_instancing()){ printf("[ASTRA] Instancing buffers failed\n"); cleanup(); return 1; }
     if (!create_descriptors()) { printf("[ASTRA] Descriptors failed\n"); cleanup(); return 1; }
     update_post_descriptors();
     if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F4 BH/spacetime viz | F1 inspector | ESC quit\n");
+    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F4 BH/spacetime viz | F1 inspector | C catalog layer | U measure HUD object | T obs epoch | ESC quit\n");
     dump_inspector();
 
     auto t_prev = std::chrono::high_resolution_clock::now();

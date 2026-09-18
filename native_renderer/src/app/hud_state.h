@@ -116,6 +116,32 @@ struct HudSnapshot {
     double u13_build_ms = 0.0;         // last overlay rebuild wall cost
     double u13_advance_ms = 0.0;       // last per-frame advance cost
     double u13_upload_ms = 0.0;        // last per-frame upload cost
+
+    // ── v1.4: REAL astronomical catalog (astra.catalog authority, HYG v4.1 +
+    //    OpenNGC; sha256-verified). classifications REAL/DATA_DERIVED/MODELED.
+    bool     cat_available = false;    // catalog binaries loaded+verified
+    char     cat_status_word[64] = "NOT AVAILABLE"; // load failure why (or star counts)
+    int      cat_mode = 0;             // 0 off / 1 stars / 2 stars+DSOs ('C')
+    uint32_t cat_star_count = 0, cat_dso_count = 0;
+    // Catalog selection ('U': nearest object to screen center; measurement
+    // from the camera-target observer — REAL parallax in the angles).
+    bool     cat_sel = false;
+    char     cat_sel_label[64] = "";   // "HYG 32263 / HIP 32349"
+    char     cat_sel_spect[32] = "";
+    double   cat_sel_ra_deg = 0.0, cat_sel_dec_deg = 0.0; // FROM OBSERVER (icrs)
+    double   cat_sel_dist_ly = 0.0;    // NaN → NOT AVAILABLE
+    double   cat_sel_delay_y = 0.0;    // NaN → NOT AVAILABLE
+    double   cat_sel_mag = 0.0;        // NaN → NOT AVAILABLE
+    double   cat_meas_epoch_y = 0.0;   // 'T' observation epoch offset (DATA_DERIVED PM view)
+    // DSO selection (OpenNGC)
+    bool     dso_sel = false;
+    char     dso_sel_label[64] = "";
+    double   dso_sel_z = 0.0;          // NaN → not measured
+    double   dso_sel_radvel = 0.0;     // NaN → not measured
+    double   dso_sel_vmag = 0.0;       // NaN → NOT AVAILABLE
+    double   dso_sel_maj_arcmin = 0.0; // NaN → NOT AVAILABLE
+    double   dso_sel_dist_proxy_mpc = 0.0; // NaN when no z (DATA_DERIVED Hubble proxy)
+    uint32_t dso_sel_type_code = 0;
 };
 
 struct HudState {

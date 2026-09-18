@@ -65,6 +65,26 @@ def test_shader_spirv_compilation():
             failed.append(f"{p}: {r.stderr[:200]}")
     assert not failed, f"SPIR-V compile failed {failed}"
 
+def test_v14_production_shaders_compile():
+    """v1.4 REAL-catalog production shaders compile via glslangValidator (compile-verified only)."""
+    validator = "/tmp/glslangValidator"
+    if not pathlib.Path(validator).exists():
+        validator = "/tmp/glslang_build2/StandAlone/glslang"
+    if not pathlib.Path(validator).exists():
+        pytest.skip("glslangValidator not built")
+    root = pathlib.Path("native_renderer/src/shaders")
+    names = ["v14_cat_stars.vert", "v14_cat_stars.frag", "v14_cat_dso.vert", "v14_cat_dso.frag"]
+    failed = []
+    for n in names:
+        p = root / n
+        assert p.exists(), f"v1.4 production shader missing: {n}"
+        r = subprocess.run([validator, "-V", str(p), "-o", "/tmp/v14_test_py.spv"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            failed.append(f"{n}: {r.stderr[:200]}")
+    assert not failed, f"v1.4 SPIR-V compile failed {failed}"
+
+
 def test_culling_lod():
     def lod(d):
         if d<5: return 0

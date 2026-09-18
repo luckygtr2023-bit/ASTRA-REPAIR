@@ -254,6 +254,11 @@ if(GLSLANG_VALIDATOR)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/hud_text.frag"
         # v1.2 additions (black-hole structure + spacetime light-ray overlay).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/bh_shell.vert"
+        # v1.4 REAL catalog additions (HYG v4.1 stars + OpenNGC deep-sky billboards).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_stars.vert"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_stars.frag"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_dso.vert"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_dso.frag"
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})
