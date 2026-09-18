@@ -177,7 +177,9 @@ No gate was weakened, none deleted; the repository's regression suites remain lo
 
 ## 7. Commit
 
-Committed to `arena/01a0b082-astra-repair` and pushed (`HEAD == origin`) after the full battery
-in §5 passed; exact hashes recorded in the session log — see git history for the authoritative
-record. If any later change in this session touches these files, this file must be updated to
-match reality (the repository state is the source of truth).
+Final landing (2026-09-18, after the branch was rebased onto the verified tip `534739e`):
+- `c38a092` — Godot legacy audit + archive of the unused Godot 4.4 prototype track
+- `844ef4d1b57974c01b78d2cb66faa7969ae1fb86` — v1.3 universe visual integration + this report
+Pushed to `origin/arena/01a0b082-astra-repair`; **`HEAD == 844ef4d1b57974c01b78d2cb66faa7969ae1fb86
+== remote`** (verified via `git ls-remote`). (This supersedes the local-only hash `75504dd`
+that this file previously referenced before the rebase.)
