@@ -273,6 +273,16 @@ if(GLSLANG_VALIDATOR)
             COMMENT "Installing production shaders next to ASTRA COSMOS.exe"
             VERBATIM
         )
+        # v1.4: runtime data assets (star LUT + sha256-verified REAL catalogs +
+        # provenance manifest) sit next to the executable; runtime probing reads
+        # them from <exe_dir>/assets first. Same mechanism the LUT relies on.
+        add_custom_command(TARGET astra_cosmos POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+                    "$<TARGET_FILE_DIR:astra_cosmos>/assets"
+            COMMENT "Installing runtime data assets (LUT, REAL catalogs) next to exe"
+            VERBATIM
+        )
     endif()
 
     # Full visual-effects shader library — opt-in; validated statically too.
