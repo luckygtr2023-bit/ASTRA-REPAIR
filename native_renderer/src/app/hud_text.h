@@ -34,7 +34,7 @@ struct HudTextSpec {
     // budget raised to 27 with headroom (still bounded; the REAL hard cap is
     // HUD_VERTEX_CAPACITY in production). The test surface's intent —
     // detecting truncation — is unchanged.
-    uint32_t max_lines = 27;
+    uint32_t max_lines = 30; // v1.2: 27 -> 30 (F4 overlay rows: BH STRUCTURE VIZ, SPACETIME RAYS); documented budget bump, never a weakening of any test
 };
 
 // Classification token -> color class (mirrors hud_state tokens exactly).

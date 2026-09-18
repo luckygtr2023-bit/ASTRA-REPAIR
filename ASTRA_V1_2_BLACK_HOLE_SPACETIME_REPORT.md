@@ -234,7 +234,11 @@ g++ -std=c++20 -O2 -I native_renderer/src \
 ```
 
 Toolchain (sandbox): GCC 12.3, glslangValidator 16.6.0, Vulkan headers
-1.4.362, Python 3.11 venv, cmake/ninja — identical versions to v1.1.
+1.4.362, Python 3.11 venv, cmake/ninja.
+**Addendum (visual phase):** the sandbox was re-provisioned mid-phase; the
+rebuilt toolchain uses Vulkan headers/loader **1.4.326** (API-stable for all
+used symbols; glslangValidator rebuilt 16.6.0 from source, `--version`
+identical 11:16.6.0). Every re-run battery leg below used 1.4.326.
 
 ## 13. Claims that are explicitly NOT made
 
@@ -244,3 +248,111 @@ spin or black-hole claims about the Sun, no modified gravity coupling,
 no persistence schema changes, no weakened tests. The renderer remains a
 pure visualization consumer; the Python package remains the scientific
 authority, byte-for-byte matched by these mirrors at IEEE-754 level.
+
+
+---
+
+## 14. ADDENDUM — v1.2 VISUAL INTEGRATION ("ASTRA must visually show the actual simulation")
+
+Date: 2026-09-18 (same session continuation). The mission's PRIMARY
+REQUIREMENT is visual: every implemented black-hole/spacetime quantity with a
+meaningful visual representation must flow authority -> native mirror ->
+authoritative sim state -> render/viz state -> native renderer -> REAL GPU
+draw path -> visible scene, with NO fake visualization. This addendum is the
+complete record of that wire-up. **Everything the physics phase shipped is
+untouched** (mirrors, gates, battery rows above all re-verified AFTER the
+visual changes).
+
+### 14.1 What became visible (in-app F4 overlay, default OFF)
+
+| Element | Source | Authority | Transform applied | Render path | Classification |
+|---|---|---|---|---|---|
+| Event-horizon disc | Sun's authoritative mass (helio sim) | `astra.blackhole` schwarzschild.py -> native `bh_schwarzschild_radius_m` (6091-bit-exact mirror) | radius = 1 r_s (exact double) x CINEMATIC magnification | 97-vertex closed LINE_STRIP (ecliptic plane) via `g_pipe_bh_shell`, red | PHYSICALLY-MODELED geometry; CINEMATIC scale |
+| Photon-sphere ring | same mass | native mirror `bh_photon_sphere_radius_m` | 1.5 r_s exact ratio | same pipeline, cyan | PHYSICALLY-MODELED; CINEMATIC scale |
+| ISCO ring | same mass | native mirror `bh_isco_radius` (prograde = 3 r_s for the modeled SCHWARZSCHILD central body) | 3 r_s exact ratio | same pipeline, amber | PHYSICALLY-MODELED; CINEMATIC scale |
+| Spacetime light rays (F4x2) | same mass | `astra.spacetime` geodesics.py -> native mirror `st_integrate_geodesic` RK4 (1000 steps/ray) + `st_cartesian_state_to_chart` massless facade | metres -> render units via the SAME scalar magnification; impact 3/3.75/4.5/6/8 r_s (> b_crit = 3 sqrt(3)/2 r_s = 2.598 r_s => escape by construction), emitter shell 25 r_s | 5 polylines x 1001 vertices, lavender | PHYSICALLY-MODELED (integration); ray SCENARIO THEORETICAL (virtual photons, not simulated bodies); CINEMATIC scale |
+| Horizon time-dilation badge | same mass | native `bh_gravitational_time_dilation_schwarzschild` | dt/dtau - 1 at photon sphere = sqrt(3)-1; at ISCO = sqrt(3/2)-1 (gated vs closed forms) | HUD/inspector rows (horizon itself: dt/dtau diverges at the boundary -> row honestly NOT AVAILABLE, never a clamped fake) | PHYSICALLY-MODELED / NOT AVAILABLE-(boundary) |
+| Kerr/spin structure | -- | engine models central spin 0 => only Schwarzschild exists | -- | -- | NOT AVAILABLE (not modeled by the engine), echoed in HUD |
+| visual magnification itself | -- | -- | one scalar `mag = 1.5 * visual_radius(sun) / r_s(sun)` printed in the HUD | -- | CINEMATIC (documented readability transform; every ratio and value exact regardless) |
+
+### 14.2 Pipeline & data flow (production runtime, `main_production.cpp`)
+
+CPU (double, mirrors) -> `app/bh_viz` builders -> vertex arrays (float only at
+the 12-byte vertex boundary) -> ONE persistent-mapped host-coherent vertex
+buffer `g_bh_vb` (8192-vertex budget; 5296 vertices used) -> per-frame when
+enabled: bind `g_pipe_bh_shell` (new shader `bh_shell.vert` + reused
+`orbit.frag`; LINE_STRIP; vec3 input; depth-test ON / depth-write OFF — the
+same depth discipline as the orbit overlay) -> 3 vkCmdDraw (rings; one push-
+constant struct: viewProj + center = `rpos[0]` target-relative under the
+floating-origin policy + per-shell color) -> +5 vkCmdDraw when rays are on ->
+++`g_perf.draw_calls` per draw (renderer statistics stay truthful). Insertion
+point: scene pass between apsis ticks (2e) and reference axes/selection marker
+(2f); post chain (bloom/tonemap/FXAA-lite composite) applies to it like every
+other scene primitive. Build is lazy and one-time (mass-change key only; a
+static solar system builds exactly once, measured 11.6 ms — gate < 200 ms).
+
+### 14.3 Failure taxonomy (graceful, never silent)
+
+invalid central mass / mirror error / ray-integration error / vertex-budget
+overflow -> console line + HUD `NOT AVAILABLE` row; structure shells remain
+drawable without rays; the overlay NEVER draws fabricated geometry, and never
+retries in a per-frame busy loop (mass latch BEFORE the attempt).
+
+### 14.4 Verification results (this phase, re-run battery)
+
+| Leg | Result |
+|---|---|
+| v11_gates (101 -> +20 section K "visual integration") | **121/121** |
+| v04..v10 (regression, unchanged suites) | 562 / 2984 / 645 / 109 / 28 / 28 / 69 — all PASS |
+| relativity / kepler / nbody / bhst mirror checks | 714/0 - 99/0 - PASS (drift 1.204e-10) - 6091/0 all-numeric-bit-exact |
+| pytest (Python authority) | **1535/1535** |
+| cmake Release build | 113 targets, 0 errors; `bh_shell.vert.spv` emitted with the other 13 SPVs into `<build>/shaders/` |
+| shader validation (glslangValidator 16.6.0, `-V --target-env vulkan1.3`) | production **14/0**, full shader tree **140/0** |
+| `main_production.cpp` vs rebuilt Win32 stub + Vulkan 1.4.326 | 0 syntax errors |
+| determinism (v11 x2, bhst x2) | byte-identical outputs |
+| extra physics sanity in gates | photon-sphere dilation sqrt(3)-1, ISCO sqrt(3/2)-1 (closed forms); rays escape with min radius 2.29..7.49 r_s > 1.5 r_s, start/end on the 25 r_s emitter shell, all vertices finite |
+
+### 14.5 Per-element "purple rectangle" test (mission Phase 11) — static view
+
+- Selection-independence: the overlay anchors to body[0] RenderState position
+  every frame (`rpos[0]` recomputed from sim state) — moving the camera (the
+  floating origin) moves ALL rendered primitives together; the overlay cannot
+  be mistaken for a screen-space decal.
+- Time-dependence: ring/ray positions are central-body-relative, and body[0]
+  sits at the camera target by construction of the ecliptic sim (Sun at
+  origin): the overlay demonstrates its scene membership through the SAME
+  view/perspective matrix as the bodies, orbits, and vectors. Simulated time
+  visibly moves the planets through this structure.
+- HUD correspondence: the overlay rows print the exact magnification and row
+  state that geometry was built from; toggling F4 changes geometry AND rows
+  together.
+- NOT runtime-verified: whether pixels land where the math says is assertable
+  only on the Windows GPU target — **NOT VERIFIED** here (no Vulkan runtime in
+  this sandbox; BLOCKED — ENVIRONMENT LIMITATION). No screenshots exist; none
+  are claimed.
+
+### 14.6 Deviations & defects found this phase
+
+1. **Gate tolerance defect (classification: TEST)** — the new closure gate
+   asserted bit-identity of the first/last ring vertex; sin(2*pi) yields
+   -2.4e-16, not 0. Measured physical closure = 2.4e-16 units. Gate now
+   asserts relative gap < 1e-15. Truncation detection semantics of other
+   gates untouched; no test was weakened (the gate became physically correct,
+   not permissive).
+2. **Toolchain version drift (classification: ENVIRONMENT)** — sandbox
+   re-provision forced a Vulkan rebuild at 1.4.326 (was 1.4.362). Recorded in
+   §12. No code implication (all used API symbols are 1.0-stable).
+3. **Sandbox re-provision x3 (classification: ENVIRONMENT)** — local checkout
+   was restored from the server branch (authoritative) via
+   `git fetch --depth=50` + `git reset --hard FETCH_HEAD`; server never lost
+   commits (verified via `git ls-remote` AND `gh api`).
+
+### 14.7 Updated NOT-made claims this phase
+
+No Windows execution; no GPU execution; no Vulkan runtime verification; no
+screenshots (none exist); no new physics (geometry-only consumer of the
+shipped mirrors); no GR corrections injected into the N-body engine; no
+persistence schema change; no audio stream added (overlay is display-only,
+exactly like the 'V' vector toggle); no weakened tests; no fabricated visual
+elements — every drawn vertex traces to an authority value through exactly one
+CINEMATIC scalar.

@@ -57,6 +57,7 @@
 #include "app/hud_text.h"
 #include "app/relativity_sim.h"
 #include "app/black_hole_sim.h"
+#include "app/bh_viz.h"
 
 // ─── Application state ────────────────────────────────────────────────────────
 static std::vector<astra::app::CelestialBody> g_bodies;
@@ -201,6 +202,18 @@ static VkPipeline g_pipe_mesh = VK_NULL_HANDLE;  // instanced lit bodies (scene 
 static VkPipeline g_pipe_orbit = VK_NULL_HANDLE; // Kepler trajectory overlays (scene pass)
 static VkPipeline g_pipe_vector = VK_NULL_HANDLE; // velocity vectors / apsis (scene pass)
 static VkPipeline g_pipe_cull = VK_NULL_HANDLE;  // GPU visibility/LOD compute
+static VkPipeline g_pipe_bh_shell = VK_NULL_HANDLE; // v1.2: BH structure + spacetime ray overlay (scene pass)
+// ─── v1.2 BH/spacetime overlay state (F4; geometry PHYSICALLY-MODELED, scale CINEMATIC) ──
+static int g_bh_overlay = 0;                     // 0 off - 1 structure shells - 2 + geodesic light rays
+static astra::app::BhVizOverlay g_bh_ov{};       // lazy cache (rebuilt only if central mass changes)
+static astra::app::BhVizRings g_bh_rings{};
+static astra::app::BhVizRays g_bh_rays{};
+static double g_bh_mass_kg = -1.0;               // cache key: central body mass (-1 = never built)
+static bool g_bh_built = false;                  // true => g_bh_ov/g_bh_rings + VB upload usable
+static constexpr uint32_t BH_VB_VERTEX_CAPACITY = 8192; // 291 ring verts + 5005 ray verts
+static VkBuffer g_bh_vb = VK_NULL_HANDLE;
+static VkDeviceMemory g_bh_vb_mem = VK_NULL_HANDLE;
+static void* g_bh_vb_mapped = nullptr;
 static VkPipeline g_pipe_bright = VK_NULL_HANDLE;
 static VkPipeline g_pipe_blur = VK_NULL_HANDLE;
 static VkPipeline g_pipe_composite = VK_NULL_HANDLE;
@@ -353,6 +366,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         case VK_OEM_PERIOD: g_step_once = true; g_audio.push(astra::app::AudioEventKind::SIM_STEP, "clock", g_clock.sim_time_s); break;
         case VK_BACK:    g_clock.sim_time_s = 0.0; g_nbody.reset(); g_audio.push(astra::app::AudioEventKind::SIM_RESET, "clock", g_clock.sim_time_s); break;
+        case VK_F4:      g_bh_overlay = (g_bh_overlay + 1) % 3; {
+            (void)g_audio; // matches 'V' vector toggle: display-only, NO audio event emission
+            printf("[ASTRA] BH structure/spacetime overlay mode %d (off/structure/+geodesic rays) [UI STATE; geometry PHYSICALLY-MODELED, scale CINEMATIC]\n", g_bh_overlay);
+            break; }
         case VK_F5:      g_clock.sim_time_s = 0.0; g_clock.paused = false; g_nbody.reset(); g_audio.push(astra::app::AudioEventKind::SIM_RESTART, "clock", g_clock.sim_time_s); break;
         case VK_F2: {    // F2 save scenario (persistence; traversal-safe names)
             astra::app::ScenarioSave s{};
@@ -902,12 +919,17 @@ static bool create_gpu_instancing() {
             g_indirect_buf, g_indirect_mem)) { ++g_perf.alloc_failures; return false; }
     if (!create_upload_buffer(hud_bytes,
             VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, g_hud_vb, g_hud_vb_mem)) { ++g_perf.alloc_failures; return false; }
+    const VkDeviceSize bh_bytes = (VkDeviceSize)BH_VB_VERTEX_CAPACITY * 12; // vec3 xyz
+    if (!create_upload_buffer(bh_bytes,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, g_bh_vb, g_bh_vb_mem)) { ++g_perf.alloc_failures; return false; }
     VK_CHECK(vkMapMemory(g_device, g_inst_mem, 0, inst_bytes, 0, &g_inst_mapped));
     VK_CHECK(vkMapMemory(g_device, g_mask_mem, 0, mask_bytes, 0, &g_mask_mapped));
     VK_CHECK(vkMapMemory(g_device, g_hud_vb_mem, 0, hud_bytes, 0, &g_hud_vb_mapped));
+    VK_CHECK(vkMapMemory(g_device, g_bh_vb_mem, 0, bh_bytes, 0, &g_bh_vb_mapped));
     memset(g_inst_mapped, 0, (size_t)inst_bytes);
     memset(g_mask_mapped, 0, (size_t)mask_bytes);
     memset(g_hud_vb_mapped, 0, (size_t)hud_bytes);
+    memset(g_bh_vb_mapped, 0, (size_t)bh_bytes);
     // Indirect commands start as zero-instance draws (safe before first dispatch).
     {
         void* p = nullptr;
@@ -919,6 +941,7 @@ static bool create_gpu_instancing() {
                   "GPU-driven command layout must match VkDrawIndexedIndirectCommand");
     printf("[ASTRA] GPU instancing/driven: %u-slot SSBO + mask + 2 batch lists + indirect cmd buf (2x20B) + HUD VB (%u verts)\n",
            INSTANCE_CAPACITY, HUD_VERTEX_CAPACITY);
+    printf("[ASTRA] v1.2 BH/spacetime overlay: %u-vert mapped VB (F4 toggle)\n", BH_VB_VERTEX_CAPACITY);
     return true;
 }
 
@@ -1371,7 +1394,7 @@ static bool create_pipelines() {
     if (!make_layout(g_dsl_compute, true, g_layout_compute)) return false;
 
     std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f, vector_v,
-                          cull_c, bright_f, blur_f, composite_f, hud_v, hud_f;
+                          bh_shell_v, cull_c, bright_f, blur_f, composite_f, hud_v, hud_f;
     if (!load_shader("astra.vert.spv", astra_v)) return false;
     if (!load_shader("astra.frag.spv", astra_f)) return false;
     if (!load_shader("sphere.vert.spv", sphere_v)) return false;
@@ -1379,6 +1402,7 @@ static bool create_pipelines() {
     if (!load_shader("orbit.vert.spv", orbit_v)) return false;
     if (!load_shader("orbit.frag.spv", orbit_f)) return false;
     if (!load_shader("vector.vert.spv", vector_v)) return false;
+    if (!load_shader("bh_shell.vert.spv", bh_shell_v)) return false;
     if (!load_shader("cull.comp.spv", cull_c)) return false;
     if (!load_shader("post_bright.frag.spv", bright_f)) return false;
     if (!load_shader("post_blur.frag.spv", blur_f)) return false;
@@ -1399,6 +1423,10 @@ static bool create_pipelines() {
     if (!make_pipeline(vector_v.data(), vector_v.size(), orbit_f.data(), orbit_f.size(),
                        VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, false,
                        g_layout_scene, g_pass_scene, g_pipe_vector)) return false;
+    // v1.2: BH structure rings + spacetime light-ray polylines (vec3 vertex input, no depth write).
+    if (!make_pipeline(bh_shell_v.data(), bh_shell_v.size(), orbit_f.data(), orbit_f.size(),
+                       VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, true, false, true,
+                       g_layout_scene, g_pass_scene, g_pipe_bh_shell)) return false;
     // Post pipelines (fullscreen triangle, no depth).
     if (!make_pipeline(astra_v.data(), astra_v.size(), bright_f.data(), bright_f.size(),
                        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
@@ -1634,6 +1662,11 @@ static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
             }
         }
     }
+    // v1.2: F4 overlay UI rows mirror exactly what the renderer draws this frame.
+    s.bh_overlay_mode  = g_bh_overlay;
+    s.bh_overlay_avail = (g_bh_overlay != 0) && g_bh_built && g_bh_ov.valid;
+    s.bh_overlay_rays  = g_bh_rays.valid;
+    s.bh_overlay_mag   = g_bh_ov.valid ? g_bh_ov.magnification : 0.0;
     return s;
 }
 
@@ -2042,6 +2075,61 @@ static bool render_frame(double fps) {
                 }
             }
         }
+        // 2fb. v1.2: BH structure + spacetime light-ray overlay (F4; global). Geometry
+        // is PHYSICALLY-MODELED by the native mirrors (bh_viz: event horizon / photon
+        // sphere / ISCO at exact scientific radii; 5 null geodesics via spacetime_sim
+        // RK4); only the CINEMATIC magnification (render units per metre) is a
+        // readability transform — ratios and every derived value stay exact, and the
+        // magnification is surfaced in the HUD. Lazy one-time build (rebuilt only if
+        // the central mass ever changes — static solar system => builds once in ~12 ms).
+        if (g_bh_overlay != 0 && n_bodies >= 1) {
+            if (g_bodies[0].mass_kg != g_bh_mass_kg && g_bh_vb_mapped) {
+                g_bh_mass_kg = g_bodies[0].mass_kg;   // latch key BEFORE the attempt (no wedged retry)
+                const double vrad0 = (double)visual_radius_units(g_bodies[0]);
+                if (astra::app::bh_viz_overlay_params(g_bodies[0].mass_kg, vrad0, g_bh_ov)) {
+                    astra::app::bh_viz_build_rings(g_bh_ov, g_bh_rings);
+                    const bool rays_ok = astra::app::bh_viz_build_light_rays(g_bodies[0].mass_kg, g_bh_ov, g_bh_rays);
+                    if (!rays_ok) g_bh_rays = astra::app::BhVizRays{}; // REPORT NOT AVAILABLE below; shells unaffected
+                    const uint32_t ring_v = (uint32_t)g_bh_rings.points.size();
+                    const uint32_t ray_v = (uint32_t)g_bh_rays.valid ? (uint32_t)g_bh_rays.points.size() : 0;
+                    if (ring_v + ray_v <= BH_VB_VERTEX_CAPACITY) {
+                        float* dst = (float*)g_bh_vb_mapped;
+                        memcpy(dst, g_bh_rings.points.data(), (size_t)ring_v * 12);
+                        if (ray_v) memcpy(dst + 3ull * ring_v, g_bh_rays.points.data(), (size_t)ray_v * 12);
+                        g_bh_built = true;
+                        printf("[ASTRA] BH overlay built: rs=%.4Gm photon=%.4Gm isco=%.4Gm, rings=%uv rays=%uv (mag=%.3g units/m)\n",
+                               g_bh_ov.rs_m, g_bh_ov.photon_m, g_bh_ov.isco_m, ring_v, ray_v, g_bh_ov.magnification);
+                    } else { ++g_perf.alloc_failures; g_bh_built = false; }
+                } else { g_bh_built = false; }
+            }
+            if (g_bh_built && g_bh_ov.valid) {
+                struct BhShellPC { astra::app::Mat4 viewProj; float center[4]; float color[4]; } pc{};
+                pc.viewProj = view_proj;
+                pc.center[0] = rpos[0][0]; pc.center[1] = rpos[0][1]; pc.center[2] = rpos[0][2]; pc.center[3] = 0.0f;
+                vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_bh_shell);
+                VkDeviceSize hz = 0;
+                vkCmdBindVertexBuffers(g_cmd_buf, 0, 1, &g_bh_vb, &hz);
+                const uint32_t ring_total = (uint32_t)g_bh_rings.points.size();
+                for (int ring = 0; ring < 3; ++ring) {
+                    memcpy(pc.color, g_bh_ov.shells[ring].color, sizeof(pc.color));
+                    vkCmdPushConstants(g_cmd_buf, g_layout_scene,
+                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                    vkCmdDraw(g_cmd_buf, g_bh_rings.spans[ring].second, 1, g_bh_rings.spans[ring].first, 0);
+                    ++g_perf.draw_calls;
+                }
+                if (g_bh_overlay >= 2 && g_bh_rays.valid) {
+                    const float rayc[4] = {0.75f, 0.55f, 1.0f, 1.0f}; // lavender photons = LIGHT RAYS (THEORETICAL-SCENARIO label in HUD)
+                    memcpy(pc.color, rayc, sizeof(pc.color));
+                    for (int r = 0; r < astra::app::BHVIZ_RAY_COUNT; ++r) {
+                        vkCmdPushConstants(g_cmd_buf, g_layout_scene,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                        vkCmdDraw(g_cmd_buf, g_bh_rays.spans[(size_t)r].second, 1,
+                                  ring_total + g_bh_rays.spans[(size_t)r].first, 0);
+                        ++g_perf.draw_calls;
+                    }
+                }
+            }
+        }
         // 2f. Reference-frame axes + selected-object marker (G toggle; marker
         // tied to the single authoritative selection id — RenderState only).
         if (g_show_axes || g_selection >= 0) {
@@ -2210,6 +2298,7 @@ static void cleanup() {
     if (g_pipe_mesh) vkDestroyPipeline(g_device, g_pipe_mesh, nullptr);
     if (g_pipe_orbit) vkDestroyPipeline(g_device, g_pipe_orbit, nullptr);
     if (g_pipe_vector) vkDestroyPipeline(g_device, g_pipe_vector, nullptr);
+    if (g_pipe_bh_shell) vkDestroyPipeline(g_device, g_pipe_bh_shell, nullptr);
     if (g_pipe_cull) vkDestroyPipeline(g_device, g_pipe_cull, nullptr);
     if (g_pipe_bright) vkDestroyPipeline(g_device, g_pipe_bright, nullptr);
     if (g_pipe_blur) vkDestroyPipeline(g_device, g_pipe_blur, nullptr);
@@ -2222,14 +2311,17 @@ static void cleanup() {
     if (g_inst_mapped) vkUnmapMemory(g_device, g_inst_mem);
     if (g_mask_mapped) vkUnmapMemory(g_device, g_mask_mem);
     if (g_hud_vb_mapped) vkUnmapMemory(g_device, g_hud_vb_mem);
+    if (g_bh_vb_mapped) vkUnmapMemory(g_device, g_bh_vb_mem);
     if (g_inst_buf) vkDestroyBuffer(g_device, g_inst_buf, nullptr);
     if (g_mask_buf) vkDestroyBuffer(g_device, g_mask_buf, nullptr);
     if (g_low_buf) vkDestroyBuffer(g_device, g_low_buf, nullptr);
     if (g_high_buf) vkDestroyBuffer(g_device, g_high_buf, nullptr);
     if (g_indirect_buf) vkDestroyBuffer(g_device, g_indirect_buf, nullptr);
     if (g_hud_vb) vkDestroyBuffer(g_device, g_hud_vb, nullptr);
+    if (g_bh_vb) vkDestroyBuffer(g_device, g_bh_vb, nullptr);
     if (g_inst_mem) vkFreeMemory(g_device, g_inst_mem, nullptr);
     if (g_mask_mem) vkFreeMemory(g_device, g_mask_mem, nullptr);
+    if (g_bh_vb_mem) vkFreeMemory(g_device, g_bh_vb_mem, nullptr);
     if (g_low_mem) vkFreeMemory(g_device, g_low_mem, nullptr);
     if (g_high_mem) vkFreeMemory(g_device, g_high_mem, nullptr);
     if (g_indirect_mem) vkFreeMemory(g_device, g_indirect_mem, nullptr);
@@ -2323,7 +2415,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     update_post_descriptors();
     if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F1 inspector | ESC quit\n");
+    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F4 BH/spacetime viz | F1 inspector | ESC quit\n");
     dump_inspector();
 
     auto t_prev = std::chrono::high_resolution_clock::now();

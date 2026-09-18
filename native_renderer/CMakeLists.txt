@@ -252,6 +252,8 @@ if(GLSLANG_VALIDATOR)
         # v0.6 additions (in-canvas HUD text; GPU-driven indirect path).
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/hud_text.vert"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/hud_text.frag"
+        # v1.2 additions (black-hole structure + spacetime light-ray overlay).
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/bh_shell.vert"
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})

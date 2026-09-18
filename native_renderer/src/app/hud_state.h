@@ -69,6 +69,14 @@ struct HudSnapshot {
     double sel_bh_rs_m = 0.0;      // r_s = 2GM/c^2 of the central body
     double sel_bh_isco_m = 0.0;    // r_ISCO = 3 r_s
     double sel_bh_photon_m = 0.0;  // r_ps = 1.5 r_s (photon sphere scale)
+    // v1.2: F4 BH structure/spacetime OVERLAY global UI state (the drawn
+    // geometry itself is PHYSICALLY-MODELED from the native mirrors via
+    // app/bh_viz; exposed here is ONLY the UI mode + the exact CINEMATIC
+    // magnification — no fabricated rendering data).
+    int  bh_overlay_mode = 0;      // 0 off / 1 structure shells / 2 + geodesic rays
+    bool bh_overlay_avail = false; // mirror cache built and valid
+    bool bh_overlay_rays = false;  // null-geodesic ray set built and valid
+    double bh_overlay_mag = 0.0;   // render units per metre (CINEMATIC transform)
 };
 
 struct HudState {

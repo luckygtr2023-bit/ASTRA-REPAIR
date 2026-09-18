@@ -1,6 +1,60 @@
 # ASTRA COSMOS — IMPLEMENTATION STATUS (v1.2)
 
-## 0. v1.2 increment — black-hole & spacetime engine binding (mirrors of astra.blackhole / astra.spacetime)
+## 0b. v1.2 VISUAL increment — black-hole/spacetime VISUAL INTEGRATION (authority -> native mirror -> render-ready geometry -> REAL Vulkan draw path)
+
+Mission: ASTRA must visually show the actual simulation. This increment wires
+the shipped v1.2 physics into the production renderer as real draw calls (F4
+overlay): (i) three structure shells around the central body — EVENT HORIZON
+r_s (red), PHOTON SPHERE 1.5 r_s (cyan), ISCO 3 r_s (amber) — ecliptic-plane
+closed polylines at EXACT double-precision radii, anchor 1.5x body visual
+radius, scalar magnification (CINEMATIC, printed in the HUD) applied ONCE at
+the vertex boundary; (ii) SPACETIME RAYS (F4x2): five null-geodesic photon
+trajectories (impact 3/3.75/4.5/6/8 r_s, emitter shell 25 r_s, 5x1001
+vertices) integrated through the native spacetime_sim mirror (RK4,
+massless-facade chart conversion), physically bent around the central mass and
+escaping (min radius 2.29-7.49 r_s, always outside the photon sphere, exactly
+as theory demands). New module `app/bh_viz` (header+impl); new shader
+`bh_shell.vert` (+reuse `orbit.frag`); new pipeline `g_pipe_bh_shell`
+(LINE_STRIP, vec3 vertex input, depth-test/no-write); ONE persistent-mapped
+vertex buffer (8192-vertex capacity, 5296 used); lazy one-time CPU build
+(~11.6 ms measured, gate < 200 ms), rebuilt only if the central mass changes;
+drawn every enabled frame between apsis ticks and the axes/markers (section
+2fb), centered on rpos[0] target-relative (floating-origin exact), ++draw_calls
+accounting. Single-place graceful fallback: invalid mass / build failure /
+VB-capacity overflow => overlay NOT AVAILABLE with a console line + HUD row,
+no fabricated geometry, no wedged retry. HUD: BH STRUCTURE VIZ (F4) + SPACETIME
+RAYS rows — UI rows correspond exactly to the rendered overlay state,
+classification strings name the authority mirrors and the CINEMATIC scale label;
+line budget 27 -> 30 documented. Kerr visualisation: NOT AVAILABLE (engine
+models central spin as 0) — echoed honestly in HUD/viz taxonomy. No persistence
+schema change, no audio event (matches 'V' vectors), no change to any existing
+toggle or save format.
+Verification: v11_gates section K added — 101 -> **121/121** (rings on exact
+shell radii & closed, ray shapes/escape properties/finiteness, dilation vs the
+closed forms sqrt(3)-1 and sqrt(3/2)-1, invalid-mass rejection, HUD row
+correspondence incl. explicit NOT-AVAILABLE, real one-time build wall clock).
+One gate defect found & fixed (classification TEST tolerance defect: closure
+gate demanded bit-identity of sin(2*pi); measured physical closure 2.4e-16,
+gate now asserts rel gap < 1e-15 — the test's truncation semantics unchanged).
+Full battery re-run: v04 562/562 - v05 2984/2984 - v06 645/645 - v07 109/109 -
+v08 28/28 - v09 28/28 - v10 69/69 - v11 121/121 - relativity 714/0 - kepler
+99/0 - nbody PASS - bhst 6091/0 all-numeric-bit-exact - pytest 1535/1535 -
+cmake Release build 113 targets 0 errors (& bh_shell.vert.spv emitted to the
+asset dir) - shader validation production 14/0 + full shader tree 140/0
+(glslangValidator 16.6.0, --target-env vulkan1.3) - main_production syntax 0
+errors vs rebuilt Win32 stub + Vulkan headers 1.4.326 (NOTE: rebuilt sandbox
+toolchain version; previous entry cited 1.4.362 SDK) - v11 & bhst repeat runs
+byte-identical (determinism).
+GPU/runtime/visual verification: NOT VERIFIED (BLOCKED — ENVIRONMENT
+LIMITATION: no Windows host, no Vulkan runtime, no GPU in this sandbox). No
+screenshots: none produced anywhere, none claimed. The draw path is
+compile-verified + statically wired and follows the identical
+pipeline/descriptor/push-constant pattern as the already-shipped velocity
+vector & orbit overlays; runtime draw verification on the Windows target
+remains an open item.
+
+
+## 0. v1.2 PHYSICS increment (shipped BEFORE 0b; kept for the record) — black-hole & spacetime engine binding (mirrors of astra.blackhole / astra.spacetime)
 
 Full report: `ASTRA_V1_2_BLACK_HOLE_SPACETIME_REPORT.md`. Two new native
 mirrors, complete authority coverage, nothing invented: `app/black_hole_sim`

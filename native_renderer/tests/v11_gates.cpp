@@ -6,6 +6,8 @@
 #include "app/black_hole_sim.h"
 #include "app/spacetime_sim.h"
 #include "app/hud_state.h"
+#include "app/bh_viz.h"
+#include <chrono>
 
 #include <cmath>
 #include <cstdio>
@@ -412,6 +414,110 @@ int main() {
             }
         CHECK(na_count == 5, "all 5 BH rows NA");
         total += 6;
+    }
+
+    // ---- K. v1.2 VISUAL INTEGRATION (mission Phase 4/5: authority -> native
+    // mirror bh_viz -> render-ready geometry; every value traced, every scale
+    // transform CINEMATIC-labeled, exact scientific ratios intact) ----
+    gate("visual integration");
+    {
+        const double vrad = 8.3;   // representative Sun visual radius (CINEMATIC, main_production formula)
+        BhVizOverlay ov;
+        CHECK(bh_viz_overlay_params(M_SUN, vrad, ov) && ov.valid, "overlay params valid for the Sun");
+        double rs_mirror = 0.0;
+        bh_schwarzschild_radius_m(M_SUN, rs_mirror);
+        CHECK(ov.rs_m == rs_mirror, "overlay r_s bit-identical to black_hole_sim mirror");
+        CHECK(ov.photon_m == 1.5 * ov.rs_m && ov.isco_m == 3.0 * ov.rs_m,
+              "photon/ISCO exact 1.5/3 r_s ratios (double)");
+        CHECK(ov.anchor_units == 1.5 * vrad && ov.magnification == (1.5 * vrad) / ov.rs_m,
+              "horizon anchor = 1.5 x body visual radius; magnification = anchor / r_s");
+        CHECK(!ov.shells[0].dilation_valid, "horizon dilation NOT AVAILABLE (boundary guard, not fabricated)");
+        CHECK(ov.shells[1].dilation_valid && ov.shells[2].dilation_valid &&
+              std::fabs(ov.shells[1].dilation_minus_one - (std::sqrt(3.0) - 1.0)) < 1e-12 &&
+              std::fabs(ov.shells[2].dilation_minus_one - (std::sqrt(1.5) - 1.0)) < 1e-12,
+              "photon/ISCO dilation dt/dtau-1 match closed forms sqrt(3)-1 / sqrt(3/2)-1");
+        // Invalid masses rejected (never a fabricated scale).
+        BhVizOverlay bad;
+        CHECK(!bh_viz_overlay_params(0.0, vrad, bad) && !bh_viz_overlay_params(-1.0, vrad, bad) &&
+              !bh_viz_overlay_params(std::nan(""), vrad, bad), "NaN/sign/zero mass rejected");
+        total += 8;
+
+        BhVizRings rings;
+        bh_viz_build_rings(ov, rings);
+        CHECK(rings.points.size() == 3ull * (BHVIZ_RING_SEGMENTS + 1),
+              "rings: 3 x 97 vertices"); total += 1;
+        bool ring_ok = rings.spans[0].first == 0;
+        for (int r = 0; r < 3 && ring_ok; ++r) {
+            ring_ok = rings.spans[r].second == (uint32_t)(BHVIZ_RING_SEGMENTS + 1);
+            const float R = (float)ov.shells[r].visual_radius_units;
+            for (uint32_t i = rings.spans[r].first; i < rings.spans[r].first + rings.spans[r].second && ring_ok; ++i) {
+                const auto& p = rings.points[i];
+                ring_ok = std::fabs(std::sqrt(p[0]*p[0] + p[1]*p[1]) - R) < 1e-3f * R && p[2] == 0.0f;
+            }
+            // closed polyline: first vs last vertex (sin(2π) != 0 in floating
+            // point; physical closure tolerance, rel error must be < 1e-15).
+            const auto& a = rings.points[rings.spans[r].first];
+            const auto& b = rings.points[rings.spans[r].first + rings.spans[r].second - 1];
+            const float gap = std::sqrt((a[0]-b[0])*(a[0]-b[0]) + (a[1]-b[1])*(a[1]-b[1]) + (a[2]-b[2])*(a[2]-b[2]));
+            ring_ok = ring_ok && gap <= 1e-15f * (R > 1.0f ? R : 1.0f);
+        }
+        CHECK(ring_ok, "ring vertices lie on shells in the ecliptic plane, closed polylines"); total += 1;
+
+        const auto tr0 = std::chrono::steady_clock::now();
+        BhVizRays rays;
+        const bool rays_ok = bh_viz_build_light_rays(M_SUN, ov, rays);
+        const double build_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - tr0).count();
+        CHECK(rays_ok && rays.valid, "5 null geodesics integrate (spacetime_sim RK4)");
+        CHECK(build_ms < 200.0, "one-time CPU build under 200 ms (REAL measured)");
+        bool rays_shape = rays_ok;
+        CHECK(!rays_ok || rays.points.size() == (size_t)BHVIZ_RAY_COUNT * (BHVIZ_RAY_STEPS + 1),
+              "5 x 1001 ray vertices contiguous"); total += 1;
+        for (int ray = 0; ray < BHVIZ_RAY_COUNT && rays_shape; ++ray) {
+            const auto& sp = rays.spans[(size_t)ray];
+            rays_shape = sp.second == (uint32_t)(BHVIZ_RAY_STEPS + 1);
+            double rmin = 1e300;
+            double r0 = -1.0, rend = -1.0;
+            for (uint32_t i = sp.first; i < sp.first + sp.second && rays_shape; ++i) {
+                const auto& p = rays.points[i];
+                rays_shape = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+                const double r_m = std::sqrt((double)p[0]*p[0] + (double)p[1]*p[1] + (double)p[2]*p[2]) / ov.magnification;
+                if (r_m < rmin) rmin = r_m;
+                if (i == sp.first) r0 = r_m;
+                rend = r_m;
+            }
+            // Physical sanity: rays escape (never inside 1.5 r_s), start/end near the
+            // 25 r_s emitter shell — CINEMATIC magnification divides out exactly.
+            rays_shape = rays_shape && rmin > 1.5 * ov.rs_m && r0 > 24.0 * ov.rs_m &&
+                         rend > 24.0 * ov.rs_m && r0 < 30.0 * ov.rs_m;
+        }
+        CHECK(rays_shape, "rays escape > 1.5 r_s, begin/end at the 25 r_s emitter shell, all finite");
+        total += 4;
+
+        // HUD: UI rows correspond to rendered overlay state (mission Phase 8).
+        HudSnapshot hs;
+        hs.bh_overlay_mode = 1; hs.bh_overlay_avail = true; hs.bh_overlay_mag = ov.magnification;
+        HudState hud = build_hud(hs);
+        int viz_row = 0;
+        for (const HudRow& r : hud.status) if (std::string(r.label) == "BH STRUCTURE VIZ (F4)") {
+            ++viz_row;
+            CHECK(r.available && std::string(r.classification).find("CINEMATIC") != std::string::npos,
+                  "viz HUD row available + CINEMATIC label");
+        }
+        CHECK(viz_row == 1, "viz HUD row present exactly when overlay on");
+        hs.bh_overlay_mode = 0;
+        hud = build_hud(hs);
+        viz_row = 0;
+        for (const HudRow& r : hud.status) if (std::string(r.label) == "BH STRUCTURE VIZ (F4)") ++viz_row;
+        CHECK(viz_row == 0, "no viz HUD rows when overlay off");
+        hs.bh_overlay_mode = 2; hs.bh_overlay_avail = false;
+        hud = build_hud(hs);
+        viz_row = 0; int na_row = 0;
+        for (const HudRow& r : hud.status) if (std::string(r.label) == "BH STRUCTURE VIZ (F4)") {
+            ++viz_row; if (!r.available) ++na_row;
+        }
+        CHECK(viz_row == 1 && na_row == 1, "failed overlay honestly NOT AVAILABLE");
+        total += 5;
     }
 
     std::printf("v11_gates: %d checks, %d failures\n", total, g_fail);

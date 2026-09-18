@@ -44,6 +44,28 @@ HudState build_hud(const HudSnapshot& s) {
                               "SIMULATED (engine self-diagnostic)", true});
     }
 
+    // v1.2: BH structure/spacetime overlay (F4) — UI rows describe the same
+    // overlay the renderer draws (mission: HUD corresponds to what is rendered).
+    if (s.bh_overlay_mode != 0) {
+        if (s.bh_overlay_avail) {
+            hud.status.push_back({"BH STRUCTURE VIZ (F4)",
+                fmt("ON — horizon/photon/ISCO at 1/1.5/3 r_s, mag %.3g u/m", s.bh_overlay_mag),
+                "UI STATE; geometry PHYSICALLY-MODELED (black_hole_sim), scale CINEMATIC", true});
+            hud.status.push_back({"SPACETIME RAYS (F4x2)",
+                s.bh_overlay_mode >= 2 ? (s.bh_overlay_rays
+                    ? "ON — 5 null geodesics b=3-8 r_s, emitter 25 r_s"
+                    : "NOT AVAILABLE (geodesic build failed) — see console")
+                                       : "OFF",
+                s.bh_overlay_mode >= 2
+                    ? (s.bh_overlay_rays ? "PHYSICALLY-MODELED (spacetime_sim RK4); scenario THEORETICAL"
+                                         : NOT_AVAILABLE)
+                    : "UI STATE", s.bh_overlay_mode < 2 || s.bh_overlay_rays});
+        } else {
+            hud.status.push_back({"BH STRUCTURE VIZ (F4)", NOT_AVAILABLE,
+                                  "(invalid central mass / build failed — see console)", false});
+        }
+    }
+
     if (s.selected_index >= 0 && s.has_selected_kind) {
         hud.selection.push_back({"SELECTED", s.selected_name, "ENGINE ID", true});
         hud.selection.push_back({"TYPE", s.selected_kind, "SIMULATED", true});
