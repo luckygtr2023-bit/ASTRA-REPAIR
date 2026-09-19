@@ -73,7 +73,8 @@ def test_v14_production_shaders_compile():
     if not pathlib.Path(validator).exists():
         pytest.skip("glslangValidator not built")
     root = pathlib.Path("native_renderer/src/shaders")
-    names = ["v14_cat_stars.vert", "v14_cat_stars.frag", "v14_cat_dso.vert", "v14_cat_dso.frag"]
+    names = ["v14_cat_stars.vert", "v14_cat_stars.frag", "v14_cat_dso.vert", "v14_cat_dso.frag",
+             "v15_travel.vert", "v15_travel.frag"]
     failed = []
     for n in names:
         p = root / n

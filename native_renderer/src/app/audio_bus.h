@@ -30,7 +30,11 @@ enum class AudioEventKind {
     SCENARIO_SAVE, SCENARIO_LOAD,
     SONIFICATION_REQUEST,   // request for a DATA-backed signal playback
     IMPACT_MODELED,         // destruction-backed event (PHYSICALLY_MODELED)
-    VACUUM_ACOUSTIC_REQUEST // deliberately testable dishonest request (rejected)
+    VACUUM_ACOUSTIC_REQUEST, // deliberately testable dishonest request (rejected)
+    TRAVEL_BEGIN,            // v1.5: journey started (class SPECULATIVE / PHYSICALLY_MODELED)
+    TRAVEL_COMPLETE,         // v1.5: journey completed
+    TRAVEL_ABORT,            // v1.5: journey aborted
+    TRAVEL_INVALID           // v1.5: journey state invalid (fail-closed)
 };
 
 struct AudioEvent {

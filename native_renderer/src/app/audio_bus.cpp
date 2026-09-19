@@ -23,6 +23,13 @@ AudioClass default_classification(AudioEventKind kind) {
         return AudioClass::PHYSICALLY_MODELED;
     case AudioEventKind::VACUUM_ACOUSTIC_REQUEST:
         return AudioClass::REAL_ACOUSTIC; // the request itself is mislabeled on purpose
+    case AudioEventKind::TRAVEL_BEGIN:
+    case AudioEventKind::TRAVEL_COMPLETE:
+    case AudioEventKind::TRAVEL_ABORT:
+        return AudioClass::SPECULATIVE;  // v1.5: traversal/warp are unestablished physics;
+                                         // the cue is a UI mark, NEVER a recorded sound.
+    case AudioEventKind::TRAVEL_INVALID:
+        return AudioClass::CINEMATIC;    // fail-closed UI failure cue (not physics)
     }
     return AudioClass::CINEMATIC;
 }
@@ -96,6 +103,10 @@ const char* audio_event_kind_name(AudioEventKind k) {
     case AudioEventKind::SONIFICATION_REQUEST: return "SONIFICATION_REQUEST";
     case AudioEventKind::IMPACT_MODELED: return "IMPACT_MODELED";
     case AudioEventKind::VACUUM_ACOUSTIC_REQUEST: return "VACUUM_ACOUSTIC_REQUEST";
+    case AudioEventKind::TRAVEL_BEGIN: return "TRAVEL_BEGIN";
+    case AudioEventKind::TRAVEL_COMPLETE: return "TRAVEL_COMPLETE";
+    case AudioEventKind::TRAVEL_ABORT: return "TRAVEL_ABORT";
+    case AudioEventKind::TRAVEL_INVALID: return "TRAVEL_INVALID";
     }
     return "UNKNOWN";
 }

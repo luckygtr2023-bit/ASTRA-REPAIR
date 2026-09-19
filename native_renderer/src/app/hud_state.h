@@ -142,6 +142,26 @@ struct HudSnapshot {
     double   dso_sel_maj_arcmin = 0.0; // NaN → NOT AVAILABLE
     double   dso_sel_dist_proxy_mpc = 0.0; // NaN when no z (DATA_DERIVED Hubble proxy)
     uint32_t dso_sel_type_code = 0;
+
+    // ── v1.5: EXTREME SPACETIME + EXPLORATION (mirror of interaction journey
+    //    authority). THEORETICAL geometry / SPECULATIVE feasibility labels are
+    //    attached here, not implied by visuals.
+    bool     trv_armed = false;        // any journey live (not IDLE)
+    int      trv_mech = 0;             // 0 conventional / 1 wormhole / 2 warp
+    int      trv_state = 0;            // TravState ordinal (0..7)
+    char     trv_causal[192] = "NOT AVAILABLE";
+    double   trv_gamma = 0.0;          // NaN → NOT AVAILABLE (warp: gamma 1)
+    double   trv_t_coord = 0.0;        // coordinate time (journey clock, s)
+    double   trv_t_proper = 0.0;       // proper time (s)
+    double   trv_throat_km = 0.0;      // NaN when not wormhole
+    double   trv_redshift = 0.0;       // NaN when not wormhole
+    double   trv_tidal = 0.0;          // m/s^2 at throat (NaN → NOT AVAILABLE)
+    double   trv_bubble_km = 0.0;      // NaN when not warp
+    double   trv_wall = 0.0;           // sigma 1/m (NaN when not warp)
+    double   trv_eff_rate_c = 0.0;     // effective displacement rate /c (NaN when not warp)
+    bool     trv_observer_travel = false; // eye overridden by journey
+    char     trv_origin_name[48] = "NOT AVAILABLE";
+    char     trv_dest_name[48] = "NOT AVAILABLE";
 };
 
 struct HudState {

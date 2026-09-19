@@ -274,7 +274,7 @@ class TraversalPlan:
                 return ain  # start at the mouth center (d_approach == 0)
             lam = (v * t)
             return _lerp(s0, ain, min(lam / self._d_approach, 1.0))
-        if t <= self._b_exit:
+        if t <= self._b_done:
             frac = min((v * (t - self._b_entry)) / (2.0 * self._d_throat), 1.0)
             return _lerp(ain, aout, frac)
         return aout

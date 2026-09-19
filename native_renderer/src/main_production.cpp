@@ -39,6 +39,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -55,6 +56,7 @@
 #include "app/star_lut.h"
 // v1.4: REAL astronomical catalog (astra.catalog authority; sha256-verified)
 #include "catalog/astro_catalog.h"
+#include "app/extreme_sim.h"          // v1.5: mirror of traversal/warp/journey authorities
 #include <cstdio>
 #include "app/render_math.h"
 #include "app/hud_text.h"
@@ -245,6 +247,42 @@ static astra::catalog::StarMeasurement g_cat_meas{};
 static bool     g_cat_meas_valid = false;
 static double   g_cat_meas_years = 0.0;    // 'T': J2000+t observation epoch (proper-motion view)
 static constexpr double CAT_SHELL_UNITS = 90000.0; // scene sky sphere (z_far 100000)
+// ─── v1.5 EXTREME SPACETIME + EXPLORATION (authority mirror; FSM options) ───
+// THEORETICAL/SPECULATIVE surfaces are labeled here and on the HUD; nothing in
+// the visual overlay physically claims traversable wormholes/warp drives.
+static astra::v15::TravelFSM g_trv_fsm;
+static astra::v15::TraversalPlan g_trv_wh_plan{};
+static astra::v15::WarpPlan      g_trv_wp_plan{};
+static astra::v15::ConventionalPlan g_trv_cv_plan{};
+static astra::v15::TravelMechanism g_trv_mech = astra::v15::TravelMechanism::WORMHOLE; // 'B' cycles (IDLE)
+static bool  g_trv_involved_spawn = false;   // true once any journey armed (events)
+static astra::v15::TravState g_trv_last_state = astra::v15::TravState::IDLE;
+static int   g_trv_origin_body = -1, g_trv_dest_body = -1;
+static bool  g_trv_restore_pending = false;
+static int   g_trv_saved_focus = -1;
+static CamMode g_trv_saved_cammode = CamMode::FOLLOW;
+static float g_trv_saved_freepos[3] = {0,0,0};
+static VkBuffer        g_trv_buf = VK_NULL_HANDLE;
+static VkDeviceMemory  g_trv_mem = VK_NULL_HANDLE;
+static void*           g_trv_mapped = nullptr;
+static VkDescriptorSet g_ds_travel = VK_NULL_HANDLE;
+static VkPipeline      g_pipe_travel = VK_NULL_HANDLE;
+static uint32_t        g_trv_mark_count = 0;
+static constexpr uint32_t TRAVEL_MARK_CAPACITY = 4096; // rings/tunnel/bubble/observer/line
+struct TravelMark { float pos[3]; float size_px; float rgb[3]; float flags; }; // 32 B (matches shader)
+static constexpr double TRV_WORMHOLE_RT_KM = 1000.0;      // documented engine default (toy MT geometry)
+static constexpr double TRV_WARP_BUBBLE_KM = 100.0;       // bubble radius (toy Alcubierre)
+static constexpr double TRV_WARP_SIGMA = 5.0;             // 1/m
+static constexpr double TRV_WARP_VS_C = 3.0;              // effective chart displacement (>=c → ACAUSAL classified)
+static constexpr double TRV_CONV_BETA = 0.5;              // conventional journey speed (fail-closed <c)
+// forward decls (window proc sits earlier in TU)
+static const char* trv_mech_name();
+static bool trv_journey_active();
+static void trv_hard_reset();
+static bool trv_arm_and_begin();
+static void trv_handle_complete();
+static uint32_t trv_build_marks(const double focus[3]);
+static void trv_step_frame(double sim_dt_s);
 static VkPipeline g_pipe_bright = VK_NULL_HANDLE;
 static VkPipeline g_pipe_blur = VK_NULL_HANDLE;
 static VkPipeline g_pipe_composite = VK_NULL_HANDLE;
@@ -480,7 +518,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case 'C': g_cat_mode = (g_cat_mode + 1) % 3; break; // v1.4 REAL catalog layer
         case 'U': {   // v1.4 measure nearest catalog object to screen center
             if (g_cat_ok) {
-                const double tw[3] = {g_world[(size_t)g_focus][0], g_world[(size_t)g_focus][1], g_world[(size_t)g_focus][2]};
+                double tw[3] = {g_world[(size_t)g_focus][0], g_world[(size_t)g_focus][1], g_world[(size_t)g_focus][2]};
+                if (trv_journey_active()) {  // v1.5: measurement observer = journey state (observer-relative)
+                    const astra::v15::Vec3 J = g_trv_fsm.position();
+                    tw[0] = J.x; tw[1] = J.y; tw[2] = J.z;
+                }
                 float off_f[3]; g_camera.eye_offset(off_f);
                 double n = std::sqrt((double)off_f[0]*off_f[0] + (double)off_f[1]*off_f[1] + (double)off_f[2]*off_f[2]);
                 if (n > 0.0) {
@@ -500,6 +542,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_cat_meas_years > 20000.0) g_cat_meas_years = -20000.0;
             g_cat_sel_dirty = true;
             printf("[ASTRA] v1.4 observation epoch J2000 %+0.0f yr\n", g_cat_meas_years);
+        } break;
+        case 'B': {   // v1.5: cycle travel MECHANISM (only while IDLE; preserves C/U/T)
+            using astra::v15::TravelMechanism; using astra::v15::TravState;
+            if (g_trv_fsm.state() != TravState::IDLE) {
+                printf("[ASTRA] v1.5 mechanism change refused mid-journey (state=%s) — abort first ('Y')\n",
+                       astra::v15::trav_state_name(g_trv_fsm.state()));
+                break;
+            }
+            g_trv_mech = g_trv_mech == TravelMechanism::WORMHOLE ? TravelMechanism::WARP
+                       : g_trv_mech == TravelMechanism::WARP ? TravelMechanism::CONVENTIONAL_RELATIVISTIC
+                       : TravelMechanism::WORMHOLE;
+            printf("[ASTRA] v1.5 travel mechanism: %s\n", trv_mech_name());
+            g_audio.push(astra::app::AudioEventKind::UI_MODE, "travel_mechanism", g_clock.sim_time_s);
+        } break;
+        case 'Y': {   // v1.5: begin journey / abort journey / clear terminal state
+            using astra::v15::TravState;
+            const TravState st = g_trv_fsm.state();
+            if (st == TravState::IDLE) {
+                trv_arm_and_begin();
+            } else if (trv_journey_active()) {
+                g_trv_fsm.abort();
+                g_trv_last_state = TravState::ABORTED;
+                printf("[ASTRA] v1.5 journey ABORTED by operator (observer stays mid-path; restoration available)\n");
+                g_audio.push(astra::app::AudioEventKind::TRAVEL_ABORT, "journey", g_clock.sim_time_s);
+            } else {
+                printf("[ASTRA] v1.5 journey state %s — cleared to IDLE (observer anchor preserved)\n",
+                       astra::v15::trav_state_name(st));
+                trv_hard_reset();
+            }
         } break;
         case VK_OEM_4: {                         // [ — exposure down (CINEMATIC display param)
             g_exposure = astra::app::clamp_exposure(g_exposure / 1.25f);
@@ -1015,6 +1086,201 @@ static bool init_catalog() {
     return true; // pipeline owns catalogs; never initializer-fatal
 }
 
+// ─── v1.5 journey helpers (authority mirror; renderer never re-decides) ─────
+static const char* trv_mech_name() {
+    switch (g_trv_mech) {
+        case astra::v15::TravelMechanism::WORMHOLE: return "WORMHOLE (Morris-Thorne; geometry THEORETICAL, feasibility SPECULATIVE)";
+        case astra::v15::TravelMechanism::WARP: return "WARP (Alcubierre; SPECULATIVE)";
+        default: return "CONVENTIONAL (<c relativistic; SIMULATED)";
+    }
+}
+static bool trv_journey_active() {
+    using astra::v15::TravState;
+    const astra::v15::TravState st = g_trv_fsm.state();
+    return st >= TravState::APPROACHING && st <= TravState::EXIT;
+}
+static void trv_hard_reset() {
+    g_trv_fsm = astra::v15::TravelFSM(); // fresh IDLE (deterministic, no stale state)
+    g_trv_last_state = astra::v15::TravState::IDLE;
+    g_trv_mark_count = 0;
+    g_trv_origin_body = -1; g_trv_dest_body = -1;
+}
+static astra::v15::Vec3 trv_body_pos_css(int b) {
+    const double* w = g_world[(size_t)b];
+    return astra::v15::Vec3{w[0], w[1], w[2]};
+}
+// Arm + begin. Requires a distinct selected DESTINATION body (no fabricated targets).
+static bool trv_arm_and_begin() {
+    using namespace astra::v15;
+    if (g_selection < 0 || g_selection == g_focus) {
+        printf("[ASTRA] v1.5 travel: select a DESTINATION body (Tab) first — NOT ARMED (no fabricating targets)\n");
+        g_audio.push(astra::app::AudioEventKind::TRAVEL_INVALID, "arm_no_destination", g_clock.sim_time_s);
+        return false;
+    }
+    g_trv_origin_body = g_focus;
+    g_trv_dest_body = g_selection;
+    const Vec3 O = trv_body_pos_css(g_trv_origin_body);
+    const Vec3 D = trv_body_pos_css(g_trv_dest_body);
+    std::string err; bool ok = false;
+    switch (g_trv_mech) {
+        case TravelMechanism::WORMHOLE: {
+            g_trv_wh_plan = TraversalPlan{};
+            g_trv_wh_plan.throat_radius_m = TRV_WORMHOLE_RT_KM;
+            g_trv_wh_plan.origin = O; g_trv_wh_plan.destination = D; g_trv_wh_plan.start = O;
+            g_trv_wh_plan.v = 0.8 * ASTRA_C; g_trv_wh_plan.L = 2.0; g_trv_wh_plan.dt = 1.0e-3;
+            ok = build_traversal_plan(g_trv_wh_plan, err);
+            if (ok) ok = g_trv_fsm.init_wormhole(g_trv_wh_plan, err);
+            break;
+        }
+        case TravelMechanism::WARP: {
+            g_trv_wp_plan = WarpPlan{};
+            g_trv_wp_plan.R = TRV_WARP_BUBBLE_KM; g_trv_wp_plan.sigma = TRV_WARP_SIGMA;
+            g_trv_wp_plan.vs = TRV_WARP_VS_C * ASTRA_C;
+            g_trv_wp_plan.origin = O; g_trv_wp_plan.destination = D; g_trv_wp_plan.dt = 1.0e-3; g_trv_wp_plan.L = 2.0;
+            ok = build_warp_plan(g_trv_wp_plan, err);
+            if (ok) ok = g_trv_fsm.init_warp(g_trv_wp_plan, err);
+            break;
+        }
+        default: {
+            g_trv_cv_plan = ConventionalPlan{};
+            g_trv_cv_plan.origin = O; g_trv_cv_plan.destination = D;
+            g_trv_cv_plan.v = TRV_CONV_BETA * ASTRA_C; g_trv_cv_plan.dt = 1.0e-3;
+            ok = build_conventional_plan(g_trv_cv_plan, err);
+            if (ok) ok = g_trv_fsm.init_conventional(g_trv_cv_plan, err);
+            break;
+        }
+    }
+    if (!ok) {
+        printf("[ASTRA] v1.5 travel refused: %s (fail-closed; NOT ARMED)\n", err.c_str());
+        g_audio.push(astra::app::AudioEventKind::TRAVEL_INVALID, "arm_refused", g_clock.sim_time_s);
+        g_trv_last_state = TravState::IDLE;
+        return false;
+    }
+    // Observer restoration support: remember anchor + camera mode.
+    g_trv_saved_focus = g_focus;
+    g_trv_saved_cammode = g_cam_mode;
+    for (int k = 0; k < 3; ++k) g_trv_saved_freepos[k] = g_free_pos[k];
+    const TravState st = g_trv_fsm.begin();
+    g_trv_last_state = st;
+    g_trv_involved_spawn = true;
+    if (g_cam_mode != CamMode::FREE) g_cam_mode = CamMode::FREE; // observer rides the journey
+    printf("[ASTRA] v1.5 journey BEGUN: %s | %s -> %s (classification: geometry THEORETICAL; feasibility SPECULATIVE; events are UI marks, not sound)\n",
+           trv_mech_name(), g_bodies[(size_t)g_trv_origin_body].name.c_str(), g_bodies[(size_t)g_trv_dest_body].name.c_str());
+    g_audio.push(astra::app::AudioEventKind::TRAVEL_BEGIN, "journey", g_clock.sim_time_s);
+    return true;
+}
+// Completion: observer lands at destination; camera follows; restoration data consumed.
+static void trv_handle_complete() {
+    if (g_trv_dest_body >= 0) {
+        g_focus = g_trv_dest_body;
+        g_selection = -1; // dest is now the observer anchor; drop stale selection
+    }
+    g_cam_mode = g_trv_saved_cammode;
+    for (int k = 0; k < 3; ++k) g_free_pos[k] = 0.0f; // land ON the anchor (documented landing semantics)
+    printf("[ASTRA] v1.5 journey COMPLETE: observer anchored at %s (proper vs coordinate time on HUD)\n",
+           g_bodies[(size_t)g_trv_dest_body].name.c_str());
+    g_audio.push(astra::app::AudioEventKind::TRAVEL_COMPLETE, "journey", g_clock.sim_time_s);
+}
+// Mark generation (doubles → floats at THIS boundary only). Kinds per shader:
+// 0 mouth-ring / 1 tunnel / 2 warp-bubble / 3 observer / 4 displacement line.
+static uint32_t trv_build_marks(const double focus[3]) {
+    using astra::v15::TravState; using astra::v15::TravelMechanism;
+    if (!trv_journey_active() && g_trv_fsm.state() != TravState::COMPLETE) return 0;
+    auto* m = (TravelMark*)g_trv_mapped;
+    uint32_t n = 0;
+    const auto PUT = [&](double wx, double wy, double wz, float px, float r, float g, float b, float kind) {
+        if (n >= TRAVEL_MARK_CAPACITY) return;
+        m[n].pos[0] = (float)((wx - focus[0]) * POS_SCALE);
+        m[n].pos[1] = (float)((wy - focus[1]) * POS_SCALE);
+        m[n].pos[2] = (float)((wz - focus[2]) * POS_SCALE);
+        m[n].size_px = px; m[n].rgb[0] = r; m[n].rgb[1] = g; m[n].rgb[2] = b; m[n].flags = kind;
+        ++n;
+    };
+    // world anchors (doubles)
+    const astra::v15::Vec3 O = trv_body_pos_css(g_trv_origin_body);
+    const astra::v15::Vec3 D = trv_body_pos_css(g_trv_dest_body);
+    // Radio-visible marks (CINEMATIC display sizes; physical params stay on HUD):
+    // displacement line origin->destination (faint; plan-derived endpoints)
+    for (int i = 0; i <= 48; ++i) {
+        const double lam = (double)i / 48.0;
+        PUT(O.x + (D.x - O.x) * lam, O.y + (D.y - O.y) * lam, O.z + (D.z - O.z) * lam,
+            1.2f, 0.35f, 0.35f, 0.4f, 4.0f);
+    }
+    if (g_trv_mech == TravelMechanism::WORMHOLE) {
+        // mouth rings (two, at the mouths; radius = CINEMATIC 0.6 units so AU-scale visible)
+        const double R1 = 0.6; // render units (display setting, labeled CINEMATIC)
+        for (int ring = 0; ring < 2; ++ring) {
+            const double cx = ring ? D.x : O.x, cy = ring ? D.y : O.y, cz = ring ? D.z : O.z;
+            for (int i = 0; i < 64; ++i) {
+                const double a = 2.0 * 3.14159265358979323846 * (double)i / 64.0;
+                // render-space ring mapped back: keep in XZ plane then offset (view aids)
+                const float ux = (float)(R1 * std::cos(a)), uz = (float)(R1 * std::sin(a));
+                m[n].pos[0] = (float)((cx - focus[0]) * POS_SCALE) + ux;
+                m[n].pos[1] = (float)((cy - focus[1]) * POS_SCALE) + (float)(0.15 * R1 * std::sin(2.0 * a));
+                m[n].pos[2] = (float)((cz - focus[2]) * POS_SCALE) + uz;
+                m[n].size_px = 2.6f;
+                m[n].rgb[0] = ring ? 0.2f : 0.9f; m[n].rgb[1] = ring ? 0.9f : 0.3f; m[n].rgb[2] = 0.9f;
+                m[n].flags = 0.0f; ++n;
+                if (n >= TRAVEL_MARK_CAPACITY) break;
+            }
+        }
+        // tunnel corridor (origin→destination: throat chart line, plan-derived)
+        for (int i = 0; i <= 96 && n + 3 < TRAVEL_MARK_CAPACITY; ++i) {
+            const double lam = (double)i / 96.0;
+            const double cx = O.x + (D.x - O.x) * lam, cy = O.y + (D.y - O.y) * lam, cz = O.z + (D.z - O.z) * lam;
+            for (int kk = 0; kk < 3; ++kk) {
+                const double a = 2.0 * 3.14159265358979323846 * (double)kk / 3.0 + lam * 12.566370614359;
+                const float px = (float)((cx - focus[0]) * POS_SCALE);
+                const float pyaw = (float)((cy - focus[1]) * POS_SCALE);
+                const float pz = (float)((cz - focus[2]) * POS_SCALE);
+                m[n].pos[0] = px + (float)(0.25 * std::cos(a));
+                m[n].pos[1] = pyaw + (float)(0.25 * 0.4 * std::sin(a));
+                m[n].pos[2] = pz + (float)(0.25 * std::sin(a));
+                m[n].size_px = 2.0f; m[n].rgb[0] = 0.5f; m[n].rgb[1] = 0.6f; m[n].rgb[2] = 1.0f; m[n].flags = 1.0f;
+                ++n;
+            }
+        }
+    }
+    if (g_trv_mech == TravelMechanism::WARP) {
+        // bubble boundary (lat/lon grid of 16x16 at the JOURNEY position; radius display-scale)
+        const astra::v15::Vec3 P = g_trv_fsm.position();
+        for (int lat = 0; lat < 16 && n + 16 < TRAVEL_MARK_CAPACITY; ++lat) {
+            const double th = 3.14159265358979323846 * (double)(lat + 1) / 17.0;
+            for (int lon = 0; lon < 16; ++lon) {
+                const double ph = 2.0 * 3.14159265358979323846 * (double)lon / 16.0;
+                const double RB = 0.5; // render units (CINEMATIC display scale)
+                const double px = (P.x - focus[0]) * POS_SCALE + RB * std::sin(th) * std::cos(ph);
+                const double py = (P.y - focus[1]) * POS_SCALE + RB * std::cos(th);
+                const double pz = (P.z - focus[2]) * POS_SCALE + RB * std::sin(th) * std::sin(ph);
+                m[n].pos[0] = (float)px; m[n].pos[1] = (float)py; m[n].pos[2] = (float)pz;
+                m[n].size_px = 2.2f; m[n].rgb[0] = 0.3f; m[n].rgb[1] = 0.9f; m[n].rgb[2] = 1.0f; m[n].flags = 2.0f;
+                ++n;
+            }
+        }
+    }
+    // observer marker (exact journey position; bright)
+    {
+        const astra::v15::Vec3 P = g_trv_fsm.position();
+        PUT(P.x, P.y, P.z, 5.0f, 1.0f, 0.85f, 0.2f, 3.0f);
+    }
+    return n;
+}
+// Per-frame journey integration (called once per frame, SIM-clock driven).
+static void trv_step_frame(double sim_dt_s) {
+    using astra::v15::TravState;
+    const TravState st = g_trv_fsm.state();
+    if (st == TravState::IDLE || st == TravState::COMPLETE || st == TravState::ABORTED || st == TravState::INVALID)
+        return;
+    const TravState nst = g_trv_fsm.step(sim_dt_s);
+    if (nst == TravState::COMPLETE) {
+        trv_handle_complete();
+    } else if (nst == TravState::INVALID) {
+        printf("[ASTRA] v1.5 journey INVALID: %s (fail-closed)\n", g_trv_fsm.invalid_reason().c_str());
+        g_audio.push(astra::app::AudioEventKind::TRAVEL_INVALID, "journey", g_clock.sim_time_s);
+    }
+    g_trv_last_state = nst;
+}
+
 // ─── v0.5/v0.6: GPU instancing + culling + driven buffers (host-coherent) ────
 static bool create_gpu_instancing() {
     const VkDeviceSize inst_bytes = (VkDeviceSize)INSTANCE_CAPACITY * sizeof(astra::app::BodyInstance);
@@ -1054,6 +1320,13 @@ static bool create_gpu_instancing() {
     VK_CHECK(vkMapMemory(g_device, g_cat_dso_mem, 0, cat_dso_bytes, 0, &g_cat_dso_mapped));
     memset(g_cat_star_mapped, 0, (size_t)cat_star_bytes);
     memset(g_cat_dso_mapped, 0, (size_t)cat_dso_bytes);
+    // v1.5: travel overlay mark SSBO (mapped; rebuilt per frame while a journey lives).
+    const VkDeviceSize trv_bytes = (VkDeviceSize)TRAVEL_MARK_CAPACITY * sizeof(TravelMark);
+    if (!create_upload_buffer(trv_bytes,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_trv_buf, g_trv_mem)) { ++g_perf.alloc_failures; return false; }
+    VK_CHECK(vkMapMemory(g_device, g_trv_mem, 0, trv_bytes, 0, &g_trv_mapped));
+    memset(g_trv_mapped, 0, (size_t)trv_bytes);
+
     memset(g_inst_mapped, 0, (size_t)inst_bytes);
     memset(g_mask_mapped, 0, (size_t)mask_bytes);
     memset(g_hud_vb_mapped, 0, (size_t)hud_bytes);
@@ -1152,10 +1425,12 @@ static bool create_descriptors() {
     // v1.4: catalog SSBO bindings (buffers allocated in create_gpu_instancing).
     VkDescriptorBufferInfo bcs{g_cat_star_buf, 0, VK_WHOLE_SIZE};
     VkDescriptorBufferInfo bcd{g_cat_dso_buf, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet wc[2]{};
+    VkDescriptorBufferInfo btv{g_trv_buf, 0, VK_WHOLE_SIZE};
+    VkWriteDescriptorSet wc[3]{};
     wc[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_cat_stars, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bcs, nullptr};
     wc[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_cat_dsos, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &bcd, nullptr};
-    vkUpdateDescriptorSets(g_device, 2, wc, 0, nullptr);
+    wc[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, g_ds_travel, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &btv, nullptr};
+    vkUpdateDescriptorSets(g_device, 3, wc, 0, nullptr);
     return true;
 }
 
@@ -1581,7 +1856,7 @@ static bool create_pipelines() {
 
     std::vector<uint32_t> astra_v, astra_f, sphere_v, sphere_f, orbit_v, orbit_f, vector_v,
                           bh_shell_v, cull_c, bright_f, blur_f, composite_f, hud_v, hud_f,
-                          cat_stars_v, cat_stars_f, cat_dso_v, cat_dso_f;
+                          cat_stars_v, cat_stars_f, cat_dso_v, cat_dso_f, trv_v, trv_f;
     if (!load_shader("astra.vert.spv", astra_v)) return false;
     if (!load_shader("astra.frag.spv", astra_f)) return false;
     if (!load_shader("sphere.vert.spv", sphere_v)) return false;
@@ -1601,6 +1876,8 @@ static bool create_pipelines() {
     if (!load_shader("v14_cat_stars.frag.spv", cat_stars_f)) return false;
     if (!load_shader("v14_cat_dso.vert.spv", cat_dso_v)) return false;
     if (!load_shader("v14_cat_dso.frag.spv", cat_dso_f)) return false;
+    if (!load_shader("v15_travel.vert.spv", trv_v)) return false;
+    if (!load_shader("v15_travel.frag.spv", trv_f)) return false;
 
     // Scene pipelines (HDR pass).
     if (!make_pipeline(astra_v.data(), astra_v.size(), astra_f.data(), astra_f.size(),
@@ -1624,6 +1901,8 @@ static bool create_pipelines() {
                              g_layout_cat, g_pipe_cat_stars)) return false;
     if (!make_pipeline_blend(cat_dso_v.data(), cat_dso_v.size(), cat_dso_f.data(), cat_dso_f.size(),
                              g_layout_cat, g_pipe_cat_dso)) return false;
+    if (!make_pipeline_blend(trv_v.data(), trv_v.size(), trv_f.data(), trv_f.size(),
+                             g_layout_cat, g_pipe_travel)) return false;  // v1.5 travel overlay
     // Post pipelines (fullscreen triangle, no depth).
     if (!make_pipeline(astra_v.data(), astra_v.size(), bright_f.data(), bright_f.size(),
                        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, false, false,
@@ -1867,6 +2146,52 @@ static astra::app::HudSnapshot make_hud_snapshot(double fps, double frame_ms) {
     // ── v1.4 REAL catalog state → HUD (classifications exact from the data).
     s.cat_available = g_cat_ok;
     s.cat_mode = g_cat_mode;
+    // ── v1.5 travel state → HUD (mirror values only; classification strings
+    // attached in hud_state.cpp; nothing fabricated: NOT AVAILABLE cells when
+    // the underlying quantity doesn't apply to the mechanism).
+    {
+        using astra::v15::TravState; using astra::v15::TravelMechanism;
+        const TravState st = g_trv_fsm.state();
+        s.trv_armed = (st != TravState::IDLE) || g_trv_involved_spawn;
+        s.trv_mech = (int)g_trv_mech;
+        s.trv_state = (int)st;
+        s.trv_observer_travel = trv_journey_active();
+        s.trv_t_coord = g_trv_fsm.coordinate_time_s();
+        s.trv_origin_name[0] = 0; s.trv_dest_name[0] = 0;
+        if (g_trv_origin_body >= 0) std::strncpy(s.trv_origin_name, g_bodies[(size_t)g_trv_origin_body].name.c_str(), sizeof(s.trv_origin_name)-1);
+        else std::strncpy(s.trv_origin_name, "NOT AVAILABLE", sizeof(s.trv_origin_name)-1);
+        if (g_trv_dest_body >= 0) std::strncpy(s.trv_dest_name, g_bodies[(size_t)g_trv_dest_body].name.c_str(), sizeof(s.trv_dest_name)-1);
+        else std::strncpy(s.trv_dest_name, "NOT AVAILABLE", sizeof(s.trv_dest_name)-1);
+        s.trv_gamma = std::numeric_limits<double>::quiet_NaN();
+        s.trv_t_proper = trv_journey_active() || st == TravState::COMPLETE ? g_trv_fsm.proper_time_s() : 0.0;
+        s.trv_throat_km = std::numeric_limits<double>::quiet_NaN();
+        s.trv_redshift = std::numeric_limits<double>::quiet_NaN();
+        s.trv_tidal = std::numeric_limits<double>::quiet_NaN();
+        s.trv_bubble_km = std::numeric_limits<double>::quiet_NaN();
+        s.trv_wall = std::numeric_limits<double>::quiet_NaN();
+        s.trv_eff_rate_c = std::numeric_limits<double>::quiet_NaN();
+        if (g_trv_mech == TravelMechanism::WORMHOLE) {
+            const double ex_ = g_trv_wh_plan.origin.x - g_trv_wh_plan.destination.x;
+            const double ey_ = g_trv_wh_plan.origin.y - g_trv_wh_plan.destination.y;
+            const double ez_ = g_trv_wh_plan.origin.z - g_trv_wh_plan.destination.z;
+            const double ext = std::sqrt(ex_ * ex_ + ey_ * ey_ + ez_ * ez_);
+            std::strncpy(s.trv_causal, astra::v15::causal_status_wormhole(ext, g_trv_wh_plan.t_total).c_str(), sizeof(s.trv_causal)-1);
+            s.trv_gamma = g_trv_wh_plan.gamma;
+            s.trv_throat_km = g_trv_wh_plan.throat_radius_m;
+            s.trv_redshift = g_trv_wh_plan.grav_factor;
+            s.trv_tidal = astra::v15::tidal_at_throat(g_trv_wh_plan.throat_radius_m, 2.0);
+        } else if (g_trv_mech == TravelMechanism::WARP) {
+            std::strncpy(s.trv_causal, astra::v15::causal_status_warp(g_trv_wp_plan.vs).c_str(), sizeof(s.trv_causal)-1);
+            s.trv_gamma = std::numeric_limits<double>::quiet_NaN(); // lapse unity → gamma=1 trivially; shown as NOT AVAILABLE to avoid implying dilation
+            s.trv_bubble_km = g_trv_wp_plan.R;
+            s.trv_wall = g_trv_wp_plan.sigma;
+            s.trv_eff_rate_c = g_trv_wp_plan.vs / astra::v15::ASTRA_C;
+        } else {
+            std::strncpy(s.trv_causal, astra::v15::causal_status_conventional(g_trv_cv_plan.t, g_trv_cv_plan.t).c_str(),
+                         sizeof(s.trv_causal)-1);
+            s.trv_gamma = g_trv_cv_plan.gamma;
+        }
+    }
     s.cat_star_count = (uint32_t)g_starcatalog.count;
     s.cat_dso_count = (uint32_t)g_dsocatalog.count;
     if (g_cat_ok) {
@@ -2097,6 +2422,14 @@ static bool render_frame(double fps) {
         }
     }
 
+    // ── v1.5: journey travel advances with the SIM clock (deterministic; the
+    // journey owns the SCIENTIFIC observer while active; camera renders what
+    // the observer sees — observer != camera is preserved in the HUD row).
+    {
+        const double sim_dt = g_clock.paused ? 0.0 : (g_clock.warp / 60.0);
+        if (sim_dt > 0.0) trv_step_frame(sim_dt);
+    }
+
     // ── View/projection (floating origin at the camera target) ──
     const astra::app::Vec3d& target = g_world[(size_t)g_focus];
     const float aspect = (float)g_sc_extent.width / (float)g_sc_extent.height;
@@ -2113,6 +2446,24 @@ static bool render_frame(double fps) {
                                          g_free_pos[0] + fwd[0], g_free_pos[1] + fwd[1], g_free_pos[2] + fwd[2],
                                          0.0f, 1.0f, 0.0f);
         for (int k = 0; k < 3; ++k) eye[k] = g_free_pos[k];
+    }
+    // v1.5: while traveling, the OBSERVER is the journey position (scientific
+    // state). The camera EYE follows the observer (observer != camera noted on
+    // HUD). eye override is recomputed BEFORE view rebuild so view stays consistent.
+    if (trv_journey_active()) {
+        using astra::v15::TravelMechanism;
+        const astra::v15::Vec3 J = g_trv_fsm.position();
+        const double ex = (J.x - target[0]) * POS_SCALE;
+        const double ey = (J.y - target[1]) * POS_SCALE;
+        const double ez = (J.z - target[2]) * POS_SCALE;
+        eye[0] = (float)ex; eye[1] = (float)ey; eye[2] = (float)ez;
+        const astra::v15::Vec3 Dp = g_trv_dest_body >= 0 ? trv_body_pos_css(g_trv_dest_body) : astra::v15::Vec3{0,0,0};
+        double fx = (Dp.x - J.x), fy = (Dp.y - J.y), fz = (Dp.z - J.z);
+        const double fn = std::sqrt(fx * fx + fy * fy + fz * fz);
+        if (fn > 0.0) { fx /= fn; fy /= fn; fz /= fn; }
+        view = astra::app::Mat4::look_at((float)ex, (float)ey, (float)ez,
+                                         (float)(ex + fx), (float)(ey + fy), (float)(ez + fz),
+                                         0.0f, 1.0f, 0.0f);
     }
     const astra::app::Mat4 view_proj = astra::app::Mat4::multiply(proj, view);
 
@@ -2287,6 +2638,40 @@ static bool render_frame(double fps) {
                 vkCmdDraw(g_cmd_buf, 4, (uint32_t)g_dsocatalog.count, 0, 0);
                 ++g_perf.draw_calls;
             }
+        }
+
+        // v1.5: travel overlay — REAL RenderState journey data (marks built from
+        // plan double positions; additive billboards; depth-tested, no depth-write).
+        const double trv_focus3[3] = {target[0], target[1], target[2]};
+        g_trv_mark_count = trv_build_marks(trv_focus3);
+        if (g_trv_mark_count > 0) {
+            struct TrvPC { float vp[16]; float right[4]; float up[4]; float misc[4]; } tpc{};
+            memcpy(tpc.vp, view_proj.m, sizeof(tpc.vp));
+            {
+                const float fd[3] = {-eye[0], -eye[1], -eye[2]};
+                const float fl = std::sqrt(fd[0]*fd[0] + fd[1]*fd[1] + fd[2]*fd[2]);
+                const float f[3] = {fd[0]/fl, fd[1]/fl, fd[2]/fl};
+                float rx = -f[2];
+                float ry = 0.0f;
+                float rz = f[0];
+                const float rl = std::sqrt(rx*rx + ry*ry + rz*rz);
+                if (rl > 1e-8f) { rx/=rl; ry/=rl; rz/=rl; }
+                const float ux = ry*f[2] - rz*f[1];
+                const float uy = rz*f[0] - rx*f[2];
+                const float uz = rx*f[1] - ry*f[0];
+                tpc.right[0]=rx; tpc.right[1]=ry; tpc.right[2]=rz; tpc.right[3]=1.0f;
+                tpc.up[0]=ux; tpc.up[1]=uy; tpc.up[2]=uz; tpc.up[3]=1.0f;
+                tpc.misc[0] = (float)std::tan((g_camera.fov_deg * 3.141592653589793 / 180.0) * 0.5);
+                tpc.misc[1] = (float)g_sc_extent.height;
+                tpc.misc[2] = 0.0f; tpc.misc[3] = 0.0f;
+            }
+            vkCmdBindPipeline(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipe_travel);
+            vkCmdPushConstants(g_cmd_buf, g_layout_cat, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(tpc), &tpc);
+            vkCmdBindDescriptorSets(g_cmd_buf, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout_cat,
+                                    0, 1, &g_ds_travel, 0, nullptr);
+            vkCmdDraw(g_cmd_buf, 4, g_trv_mark_count, 0, 0);
+            ++g_perf.draw_calls;
         }
 
         // 2b. Instanced bodies — GPU-DRIVEN indirect draws (LOW, HIGH batch).
@@ -2638,10 +3023,12 @@ static void cleanup() {
     if (g_bh_vb) vkDestroyBuffer(g_device, g_bh_vb, nullptr);
     if (g_cat_star_buf) vkDestroyBuffer(g_device, g_cat_star_buf, nullptr);
     if (g_cat_dso_buf) vkDestroyBuffer(g_device, g_cat_dso_buf, nullptr);
+    if (g_trv_buf) { if (g_trv_mapped) vkUnmapMemory(g_device, g_trv_mem); vkDestroyBuffer(g_device, g_trv_buf, nullptr); vkFreeMemory(g_device, g_trv_mem, nullptr); }
     if (g_cat_star_mem) vkFreeMemory(g_device, g_cat_star_mem, nullptr);
     if (g_cat_dso_mem) vkFreeMemory(g_device, g_cat_dso_mem, nullptr);
     if (g_pipe_cat_stars) vkDestroyPipeline(g_device, g_pipe_cat_stars, nullptr);
     if (g_pipe_cat_dso) vkDestroyPipeline(g_device, g_pipe_cat_dso, nullptr);
+    if (g_pipe_travel) vkDestroyPipeline(g_device, g_pipe_travel, nullptr);
     if (g_layout_cat) vkDestroyPipelineLayout(g_device, g_layout_cat, nullptr);
     if (g_dsl_cat) vkDestroyDescriptorSetLayout(g_device, g_dsl_cat, nullptr);
     if (g_inst_mem) vkFreeMemory(g_device, g_inst_mem, nullptr);
@@ -2741,7 +3128,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     update_post_descriptors();
     if (!create_pipelines())  { printf("[ASTRA] Pipelines failed\n"); cleanup(); return 1; }
 
-    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F4 BH/spacetime viz | F1 inspector | C catalog layer | U measure HUD object | T obs epoch | ESC quit\n");
+    printf("[ASTRA] v0.6 controls: arrows look | PgUp/PgDn zoom/speed | Tab select+focus | X deselect | O free/orbit cam | WASDQE move | +/- warp | 0-8 presets | Space pause | . step | BKSP epoch | F5 restart | F2 save F3 load | V vectors | P apsis | G axes | H HUD | [ ] exposure | F4 BH/spacetime viz | F1 inspector | C catalog layer | U measure HUD object | T obs epoch | B travel mechanism | Y begin/abort journey | ESC quit\n");
     dump_inspector();
 
     auto t_prev = std::chrono::high_resolution_clock::now();

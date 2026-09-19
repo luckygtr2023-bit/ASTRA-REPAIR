@@ -44,7 +44,39 @@ HudState build_hud(const HudSnapshot& s) {
     } else {
         hud.status.push_back({"CATALOG DATASET", NOT_AVAILABLE, "NOT AVAILABLE (dataset unverified/absent)", false});
     }
-    hud.status.push_back({"VIZ MODE", s.viz_mode, "SIMULATED", true});
+        // ── v1.5 EXTREME SPACETIME + EXPLORATION rows --------------------------------
+    if (s.trv_armed) {
+        const char* mech = s.trv_mech == 1 ? "WORMHOLE (Morris-Thorne)" :
+                           s.trv_mech == 2 ? "WARP (Alcubierre)" : "CONVENTIONAL (<c)";
+        const char* cls = s.trv_mech == 0 ? "SIMULATED (relativistic, validated)" : "SPECULATIVE (geometry THEORETICAL; feasibility not established)";
+        static const char* STATES[] = {"IDLE","APPROACHING","ENTRY","TRANSIT","EXIT","COMPLETE","ABORTED","INVALID"};
+        const char* st = STATES[(s.trv_state >= 0 && s.trv_state < 8) ? s.trv_state : 7];
+        hud.status.push_back({"TRAVEL MODEL", mech, cls, true});
+        hud.status.push_back({"TRAVEL STATE", st, "SIMULATED (deterministic FSM)", true});
+        hud.status.push_back({"ORIGIN", s.trv_origin_name, "SIMULATED (scene body anchor)", true});
+        hud.status.push_back({"DESTINATION", s.trv_dest_name, "SIMULATED (scene body anchor)", true});
+        hud.status.push_back({"CAUSAL STATUS", s.trv_causal, s.trv_mech == 0 ? "SIMULATED" : "SPECULATIVE (reported, never hidden)", true});
+        hud.status.push_back({"COORDINATE TIME", fmt("%.6f s", s.trv_t_coord), "DATA_DERIVED (journey clock)", true});
+        hud.status.push_back({"PROPER TIME", fmt("%.6f s", s.trv_t_proper), "DATA_DERIVED (delegated dilation)", true});
+        if (s.trv_mech != 2) {
+            hud.status.push_back({"GAMMA", std::isnan(s.trv_gamma) ? NOT_AVAILABLE : fmt("%.6f", s.trv_gamma),
+                              std::isnan(s.trv_gamma) ? "NOT AVAILABLE" : "DATA_DERIVED (relativity authority)", !std::isnan(s.trv_gamma)});
+        }
+        if (s.trv_mech == 1) {
+            hud.status.push_back({"THROAT RADIUS", std::isnan(s.trv_throat_km) ? NOT_AVAILABLE : fmt("%.3f km", s.trv_throat_km), "THEORETICAL", true});
+            hud.status.push_back({"REDSHIFT @ THROAT", fmt("%.9g (Phi=0 default)", s.trv_redshift), "THEORETICAL", true});
+            hud.status.push_back({"TIDAL @ THROAT", std::isnan(s.trv_tidal) ? NOT_AVAILABLE : fmt("%.6g m/s^2 (L=2m, model-limited)", s.trv_tidal),
+                                  "THEORETICAL (first-order)", !std::isnan(s.trv_tidal)});
+        }
+        if (s.trv_mech == 2) {
+            hud.status.push_back({"BUBBLE RADIUS", std::isnan(s.trv_bubble_km) ? NOT_AVAILABLE : fmt("%.3f km", s.trv_bubble_km), "THEORETICAL", true});
+            hud.status.push_back({"WALL SIGMA", std::isnan(s.trv_wall) ? NOT_AVAILABLE : fmt("%.3f 1/m", s.trv_wall), "THEORETICAL", true});
+            hud.status.push_back({"EFFECTIVE RATE", fmt("%.3f c (LOCAL MOTION = 0 — displacement by geometry)", s.trv_eff_rate_c), "SPECULATIVE", true});
+        }
+        hud.status.push_back({"OBSERVER", s.trv_observer_travel ? "TRAVELING (journey state drives the scientific observer)" : "AT ANCHOR",
+                              "SIMULATED (observer != camera; camera follows)", true});
+    }
+hud.status.push_back({"VIZ MODE", s.viz_mode, "SIMULATED", true});
     hud.status.push_back({"GRAVITY",
         s.gravity_model == "nbody" ? "NBODY velocity-Verlet dt=3600s" : "KEPLER two-body",
         "SIMULATED", true});

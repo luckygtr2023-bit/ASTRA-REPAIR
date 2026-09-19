@@ -1,0 +1,42 @@
+# ASTRA v1.5 reference fixtures — DERIVED FROM PYTHON AUTHORITY
+# scen_id, quantity, value(s), unit, meta — DO NOT hand-edit; regenerative via scripts/gen_v15_reference.py
+WH-O0,coord_total,1.6678204759907602e-05,s,
+WH-O0,proper_total,1.000692285594456e-05,s,
+WH-O0,gamma,1.666666666666667,,
+WH-O0,tidal_at_throat,179751035747.36353,m/s^2,
+WH-O0,redshift_at_throat,1.0,,
+WH-S0,pos,(0.0, 0.0, 0.0),m,ENTRY
+WH-S0,tau,0.0,s,ENTRY
+WH-S0.125,pos,(375000.0, 0.0, 0.0),m,ENTRY
+WH-S0.125,tau,1.25086535699307e-06,s,ENTRY
+WH-S0.25,pos,(750000.0, 0.0, 0.0),m,TRANSIT
+WH-S0.25,tau,2.50173071398614e-06,s,TRANSIT
+WH-S0.5,pos,(1500000.0, 0.0, 0.0),m,TRANSIT
+WH-S0.5,tau,5.00346142797228e-06,s,TRANSIT
+WH-S0.75,pos,(2250000.0, 0.0, 0.0),m,EXIT
+WH-S0.75,tau,7.505192141958419e-06,s,EXIT
+WH-S0.999,pos,(2997000.0, 0.0, 0.0),m,EXIT
+WH-S0.999,tau,9.996915933088615e-06,s,EXIT
+WH-S1,pos,(3000000.0, 0.0, 0.0),m,COMPLETE
+WH-S1,tau,1.000692285594456e-05,s,COMPLETE
+WP-O0,coord_total,0.0033356409519815205,s,
+WP-O0,proper_total,0.0033356409519815205,s,
+WP-O0,effective_rate,899377374.0,m/s,
+WP-O0,local_speed,0.0,m/s,
+WP-O0,causality,'SPECULATIVE_ACAUSAL_EFFECTIVE_DISPLACEMENT (no local light-c',text,
+WP-S0,pos,(0.0, 0.0, 0.0),m,
+WP-S0.25,pos,(750000.0, 0.0, 0.0),m,
+WP-S0.5,pos,(1500000.0, 0.0, 0.0),m,
+WP-S0.75,pos,(2250000.0, 0.0, 0.0),m,
+WP-S1,pos,(3000000.0, 0.0, 0.0),m,
+CV-O0,coord_total,0.020013845711889123,s,
+CV-O0,proper_total,0.01733249881391823,s,
+CV-O0,gamma,1.1547005383792517,,
+CV-S0,pos,(0.0, 0.0, 0.0),m,
+CV-S0.25,pos,(750000.0, 0.0, 0.0),m,
+CV-S0.5,pos,(1500000.0, 0.0, 0.0),m,
+CV-S0.75,pos,(2250000.0, 0.0, 0.0),m,
+CV-S1,pos,(3000000.0, 0.0, 0.0),m,
+JR-O0,ticks_to_complete,34,count,
+JR-O0,end_coord,1.7e-05,s,
+JR-O0,causal,'SPECULATIVE_ACAUSAL_EFFECTIVE (external chart light time 1.0',text,
