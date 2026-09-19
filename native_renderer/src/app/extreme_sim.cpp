@@ -3,6 +3,21 @@
 
 #include <algorithm>
 #include <cstdio>
+#include "app/relativity_sim.h"
+
+namespace astra {
+namespace v15 {
+
+double lorentz_gamma(double v) {
+    double g = 0.0;
+    if (astra::app::lorentz_factor(v, g) != astra::app::RelErr::OK) {
+        return 1.0 / 0.0;  // guard violation sentinel (+inf); plans refuse beta>=1 upstream
+    }
+    return g;
+}
+
+}  // namespace v15
+}  // namespace astra
 
 namespace astra {
 namespace v15 {

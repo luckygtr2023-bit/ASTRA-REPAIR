@@ -62,13 +62,13 @@ struct Vec3 {
     double z = 0.0;
 };
 
-// ---- physics helpers (mirror relativity.lorentz_factor et al.) -------------
-
-// gamma(v): identical formula tree to astra/relativity/core.py::lorentz_factor
-inline double lorentz_gamma(double v) {
-    const double beta2 = (v * v) / (ASTRA_C * ASTRA_C);
-    return 1.0 / std::sqrt(1.0 - beta2);
-}
+// ---- physics helpers (DELEGATED, not re-implemented) ------------------------
+// gamma(v): delegates to the native relativity authority
+// (app/relativity_sim.cpp::lorentz_factor, the v1.1 bit-exact mirror of the
+// Python authority) — no duplicate physics implementation lives here. Returns
+// +inf sentinel on guard violation (plans reject v>=c upstream, so callers
+// never rely on the sentinel; it exists so the mirror stays total).
+double lorentz_gamma(double v);
 
 // Alcubierre shape f(rs) — mirror of warp.py::shape_function (tanh-based).
 double alcubierre_shape(double rs, double R, double sigma);
