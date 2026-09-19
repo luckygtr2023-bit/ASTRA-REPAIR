@@ -148,3 +148,14 @@ No test was weakened/deleted this version line; where my own tests disagreed wit
 - **First action after connection restore:** `git push origin arena/01a0b082-astra-repair`, verify `git ls-remote` equals HEAD, then re-issue the "source-level GO" line verbatim with the remote hash recorded.
 
 *Evidence first. Claims second. Release last.*
+
+## Addendum — commit-ID reconciliation (2026-09-19, post-push)
+
+The sandbox discarded four LOCAL-ONLY commits (v1.7 d85f2c0 / v1.8 56300e5 /
+v1.9 6a4e678 / v2.0 f4afb46) during a token-expired window; the identical
+content was re-verified (battery re-run: gates 14/14, mirrors 7/7, pytest
+all-pass, validator 244/0) and re-committed, then pushed. The Phase 17
+ledger reads, for those rows:
+v1.7 `1333051` + `4e95f41` · v1.8 `a033539` · v1.9 `b8c8e24` · v2.0 `ddb533c`.
+HEAD == `origin/arena/01a0b082-astra-repair` = `ddb533c…` — the conditional
+source-level GO is therefore IN EFFECT for the source branch.
