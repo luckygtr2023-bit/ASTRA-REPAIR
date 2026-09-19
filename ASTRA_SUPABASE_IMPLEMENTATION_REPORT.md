@@ -1,5 +1,21 @@
 # ASTRA SUPABASE IMPLEMENTATION REPORT
-**Branch:** `arena/01a0a5a2-astra-cosmos` — **Date:** 2026-09-17 Asia/Calcutta  
+
+> **v1.8 VERIFICATION ADDENDUM — 2026-09-19, branch `arena/01a0b082-astra-repair`:**
+> The implementation below remains intact (11 tables, RLS, 7 private buckets,
+> traversal protection, offline-capable product layer, product-only realtime).
+> **Correction to the original claim of offline test suites:** those tests are
+> not present on this branch. A replacement battery `tests/test_v18_supabase.py`
+> (14 checks: static migration audit incl. all-11-tables + per-table RLS +
+> no-`using (true)` + auth.uid()-scoped policies + 7 private buckets +
+> foldername-owner policy + idempotency; config/env hygiene + no-service-role
+> scan; storage traversal acceptance/refusal matrix incl. documented
+> backslash-normalization semantics; offline simulator integration; realtime
+> channel allowlist) now executes in the offline battery and passed on the
+> 2026-09-19 run. Live-Supabase behavior remains **NOT VERIFIED —
+> ENVIRONMENT LIMITATION** (no network/CLI in sandbox); publishable keys stay
+> client-safe only under the RLS audit above.
+
+*Branch:** `arena/01a0a5a2-astra-cosmos` — **Date:** 2026-09-17 Asia/Calcutta  
 **Project:** `https://bzfpipxjqdrinvagojor.supabase.co` (publishable key `sb_publishable_WHOOXEK74ZpxJ0cmR2vysA_cBu7EphG` — client-safe, RLS-enforced)  
 **Status:** IMPLEMENTED — product/account/cloud layer, scientific engine remains authoritative
 
