@@ -259,7 +259,8 @@ if(GLSLANG_VALIDATOR)
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_stars.frag"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_dso.vert"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shaders/v14_cat_dso.frag
-        v15_travel.vert v15_travel.frag"
+        v15_travel.vert v15_travel.frag
+        v17_taa_resolve.frag v17_sharpen_cas.frag"
     )
     astra_compile_shaders(ASTRA_PRODUCTION_SPV ${ASTRA_PRODUCTION_SHADERS})
     add_custom_target(astra_shaders ALL DEPENDS ${ASTRA_PRODUCTION_SPV})
